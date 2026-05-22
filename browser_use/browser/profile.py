@@ -323,8 +323,29 @@ class BrowserChannel(str, Enum):
 	MSEDGE_CANARY = 'msedge-canary'
 
 
+class BrowserType(str, Enum):
+	"""Underlying browser engine. Selects the protocol/control path.
+
+	CHROMIUM is the canonical, fully-supported engine — drives Chrome /
+	Chromium / Edge variants via raw CDP (the cdp_use library). All
+	existing channels in :class:`BrowserChannel` belong to this engine.
+
+	FIREFOX is the WIP alternative engine that targets the Firefox
+	family (stock Firefox via Playwright, or anti-detect forks like
+	Camoufox). Firefox speaks WebDriver BiDi + Marionette, not CDP, so
+	the launch/session code that consumes a profile must check
+	``browser_type`` and dispatch to the appropriate driver. Phase-2
+	work — today this field is parsed and validated, but the consumer
+	paths still assume CHROMIUM.
+	"""
+
+	CHROMIUM = 'chromium'
+	FIREFOX = 'firefox'
+
+
 # Using constants from central location in browser_use.config
 BROWSERUSE_DEFAULT_CHANNEL = BrowserChannel.CHROMIUM
+BROWSERUSE_DEFAULT_BROWSER_TYPE = BrowserType.CHROMIUM
 
 
 # ===== Type definitions with validators =====
@@ -433,6 +454,17 @@ class BrowserLaunchArgs(BaseModel):
 		description='List of default CLI args to stop playwright from applying (see https://github.com/microsoft/playwright/blob/41008eeddd020e2dee1c540f7c0cdfa337e99637/packages/playwright-core/src/server/chromium/chromiumSwitches.ts)',
 	)
 	channel: BrowserChannel | None = None  # https://playwright.dev/docs/browsers#chromium-headless-shell
+	browser_type: BrowserType = Field(
+		default=BROWSERUSE_DEFAULT_BROWSER_TYPE,
+		description=(
+			'Underlying browser engine. CHROMIUM uses the CDP-driven '
+			'launch/session path (channel above selects the Chromium variant). '
+			'FIREFOX selects the Playwright Firefox engine — for stock Firefox '
+			'or anti-detect forks like Camoufox (point `executable_path` at '
+			'the Camoufox binary). Firefox-side launch/session paths are WIP — '
+			'see the firefox-compat branch.'
+		),
+	)
 	chromium_sandbox: bool = Field(
 		default=not CONFIG.IN_DOCKER, description='Whether to enable Chromium sandboxing (recommended unless inside Docker).'
 	)
@@ -458,6 +490,22 @@ class BrowserLaunchArgs(BaseModel):
 	def validate_devtools_headless(self) -> Self:
 		"""Cannot open devtools when headless is True"""
 		assert not (self.headless and self.devtools), 'headless=True and devtools=True cannot both be set at the same time'
+		return self
+
+	@model_validator(mode='after')
+	def validate_channel_consistent_with_browser_type(self) -> Self:
+		"""channel (chromium/chrome/msedge variants) is Chromium-engine-only.
+
+		Reject configs that set both browser_type=FIREFOX and a non-None
+		channel — they describe contradictory engines and would silently
+		mis-launch.
+		"""
+		if self.browser_type == BrowserType.FIREFOX and self.channel is not None:
+			raise ValueError(
+				f'channel={self.channel!r} is Chromium-only and incompatible with '
+				f'browser_type=FIREFOX. Drop `channel` (Firefox variants are selected '
+				f'via `executable_path`, e.g. pointing at the Camoufox binary).'
+			)
 		return self
 
 	@model_validator(mode='after')
