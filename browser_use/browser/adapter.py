@@ -221,6 +221,31 @@ class BrowserAdapter(ABC):
 		exposes it directly. Returns ``None`` if the backend can't
 		produce one."""
 
+	@abstractmethod
+	async def accessibility_snapshot_all_frames(self) -> dict[str, Any]:
+		"""Merged accessibility tree spanning the page and every same-process
+		sub-frame, returned as a flat node list::
+
+		    {'nodes': [{nodeId, parentId, role, name, value, ...}, ...]}
+
+		Shape compatibility note:
+
+		  - CDP backend returns the native shape from
+		    ``Accessibility.getFullAXTree`` per frame, merged. ``nodeId``
+		    matches CDP's node id space and can be cross-referenced with
+		    other CDP calls (``DOM.resolveNode`` etc.).
+		  - Playwright backend flattens its nested
+		    ``page.accessibility.snapshot`` (per frame, rooted on
+		    ``frame.frame_element()``) into the same flat shape, with
+		    **synthetic** ``nodeId`` values. Synthetic ids encode only the
+		    parent/child relationships *within this result* — they will
+		    NOT resolve via CDP APIs.
+
+		Consumers that need real CDP node ids must check the adapter
+		type or expect ``int``-coercible ids; consumers that walk the
+		tree purely for role/name/value introspection are
+		backend-portable."""
+
 	# ── Cookies ──
 
 	@abstractmethod
@@ -600,6 +625,39 @@ class CdpBrowserAdapter(BrowserAdapter):
 			nodes = [n for n in nodes if not n.get('ignored', True) and (n.get('name') or n.get('role'))]
 		return {'nodes': nodes}
 
+	async def accessibility_snapshot_all_frames(self) -> dict[str, Any]:
+		import asyncio
+		cdp = self._session.cdp_client
+		# 1. Frame tree — protocol-internal CDP op (Page.getFrameTree).
+		frame_tree = await cdp.send.Page.getFrameTree(session_id=self._session_id())
+
+		# 2. Walk all frames (DFS).
+		def _collect_frame_ids(node: dict) -> list[str]:
+			ids = [node['frame']['id']]
+			for child in node.get('childFrames') or []:
+				ids.extend(_collect_frame_ids(child))
+			return ids
+		frame_ids = _collect_frame_ids(frame_tree['frameTree'])
+
+		# 3. Per-frame ax tree in parallel. Root is required (its failure
+		# propagates); child frames that detach mid-request are tolerated.
+		requests = [
+			cdp.send.Accessibility.getFullAXTree(
+				params={'frameId': fid}, session_id=self._session_id(),
+			)
+			for fid in frame_ids
+		]
+		results = await asyncio.gather(*requests, return_exceptions=True)
+		root = results[0]
+		if isinstance(root, BaseException):
+			raise root
+		merged: list[dict] = list(root.get('nodes', []))
+		for fid, res in zip(frame_ids[1:], results[1:]):
+			if isinstance(res, BaseException):
+				continue
+			merged.extend(res.get('nodes', []))
+		return {'nodes': merged}
+
 	# Cookies ----------------------------------------------------------------
 
 	async def get_cookies(self, urls: list[str] | None = None) -> list[dict[str, Any]]:
@@ -752,6 +810,54 @@ class PlaywrightBrowserAdapter(BrowserAdapter):
 			return await self._page.accessibility.snapshot(interesting_only=interesting_only)
 		except Exception:
 			return None
+
+	async def accessibility_snapshot_all_frames(self) -> dict[str, Any]:
+		# Playwright's accessibility.snapshot returns a nested tree.
+		# We walk every same-process frame, root the snapshot at that
+		# frame's element (or page-wide for main_frame), and flatten the
+		# nested {role, name, value, children:[…]} into the flat
+		# {nodeId, parentId, role, name, value} shape callers expect from
+		# the CDP backend. nodeId values are synthetic — they encode
+		# parent/child links within THIS result only (see ABC docstring).
+		nodes: list[dict[str, Any]] = []
+		counter = {'n': 0}
+
+		def _emit(tree: dict | None, parent_id: int | None,
+		          frame_url: str) -> None:
+			if tree is None:
+				return
+			counter['n'] += 1
+			node_id = counter['n']
+			nodes.append({
+				'nodeId':       str(node_id),
+				'parentId':     str(parent_id) if parent_id is not None else None,
+				'role':         {'type': 'role',           'value': tree.get('role')},
+				'name':         {'type': 'computedString', 'value': tree.get('name')},
+				'value':        {'type': 'string',         'value': tree.get('value')} if 'value' in tree else None,
+				'frameUrl':     frame_url,            # Playwright-only extra; CDP omits.
+				'_synthetic':   True,                 # marker for backend-aware consumers
+			})
+			for child in tree.get('children') or []:
+				_emit(child, node_id, frame_url)
+
+		for frame in self._page.frames:
+			try:
+				if frame == self._page.main_frame:
+					tree = await self._page.accessibility.snapshot(interesting_only=False)
+				else:
+					# Playwright exposes frame-rooted accessibility via the
+					# `root` parameter on the page-level accessibility client.
+					handle = await frame.frame_element()
+					tree = await self._page.accessibility.snapshot(
+						interesting_only=False, root=handle,
+					)
+			except Exception:
+				# Detached / cross-origin frames may refuse — match CDP's
+				# tolerant posture: skip and continue.
+				continue
+			_emit(tree, parent_id=None, frame_url=frame.url)
+
+		return {'nodes': nodes}
 
 	# Cookies ----------------------------------------------------------------
 

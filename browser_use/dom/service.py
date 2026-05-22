@@ -331,50 +331,26 @@ class DomService:
 		return True
 
 	async def _get_ax_tree_for_all_frames(self, target_id: TargetID) -> GetFullAXTreeReturns:
-		"""Recursively collect all frames and merge their accessibility trees into a single array."""
+		"""Multi-frame accessibility tree.
 
-		cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=target_id, focus=False)
-		frame_tree = await cdp_session.cdp_client.send.Page.getFrameTree(session_id=cdp_session.session_id)
+		Now delegates to :meth:`CdpBrowserAdapter.accessibility_snapshot_all_frames`,
+		which performs the same frame-tree walk + per-frame
+		``Accessibility.getFullAXTree`` requests + merge (with
+		``return_exceptions=True`` for tolerated detached child frames,
+		root-frame failure still propagates). The return shape is
+		bit-identical to the previous direct-CDP implementation for the
+		CDP backend; the Playwright backend produces the same flat shape
+		but with synthetic nodeIds — out of scope for DomService today
+		(see adapter docstring).
+		"""
+		from browser_use.browser.adapter import CdpBrowserAdapter
 
-		def collect_all_frame_ids(frame_tree_node) -> list[str]:
-			"""Recursively collect all frame IDs from the frame tree."""
-			frame_ids = [frame_tree_node['frame']['id']]
-
-			if 'childFrames' in frame_tree_node and frame_tree_node['childFrames']:
-				for child_frame in frame_tree_node['childFrames']:
-					frame_ids.extend(collect_all_frame_ids(child_frame))
-
-			return frame_ids
-
-		# Collect all frame IDs recursively
-		all_frame_ids = collect_all_frame_ids(frame_tree['frameTree'])
-
-		# Get accessibility tree for each frame
-		ax_tree_requests = []
-		for frame_id in all_frame_ids:
-			ax_tree_request = cdp_session.cdp_client.send.Accessibility.getFullAXTree(
-				params={'frameId': frame_id}, session_id=cdp_session.session_id
-			)
-			ax_tree_requests.append(ax_tree_request)
-
-		# return_exceptions=True so a child frame detaching mid-request (e.g. ad iframes)
-		# doesn't discard AX data from the rest. The root frame is required — if it
-		# fails, propagate so the caller's retry/empty-DOM path runs instead of
-		# silently returning a tree with no main-document AX properties.
-		ax_trees = await asyncio.gather(*ax_tree_requests, return_exceptions=True)
-
-		root_result = ax_trees[0]
-		if isinstance(root_result, BaseException):
-			raise root_result
-
-		merged_nodes: list[AXNode] = list(root_result['nodes'])
-		for frame_id, ax_tree in zip(all_frame_ids[1:], ax_trees[1:]):
-			if isinstance(ax_tree, BaseException):
-				self.logger.debug(f'Skipping AX tree for detached/unreachable child frame {frame_id}: {ax_tree}')
-				continue
-			merged_nodes.extend(ax_tree['nodes'])
-
-		return {'nodes': merged_nodes}
+		adapter = await CdpBrowserAdapter.for_target(
+			self.browser_session, target_id, focus=False,
+		)
+		# Cast to the CDP-typed return — the adapter's CDP backend
+		# returns the native getFullAXTree shape unchanged.
+		return await adapter.accessibility_snapshot_all_frames()  # type: ignore[return-value]
 
 	async def _get_all_trees(self, target_id: TargetID) -> TargetAllTrees:
 		cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=target_id, focus=False)

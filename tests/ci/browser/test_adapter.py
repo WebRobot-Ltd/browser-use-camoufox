@@ -156,6 +156,43 @@ async def test_playwright_adapter_evaluate(playwright_page, httpserver) -> None:
 	assert await adapter.evaluate('(n) => n * 7', 6) == 42
 
 
+async def test_playwright_adapter_accessibility_snapshot_all_frames(playwright_page, httpserver) -> None:
+	"""accessibility_snapshot_all_frames flattens Playwright's nested tree
+	into the same flat shape the CDP backend produces. nodeIds are
+	synthetic (encoding parent/child within this result only) but the
+	{role, name, value} payload survives — backend-portable consumers
+	work either way."""
+	httpserver.expect_request('/page').respond_with_data(
+		'<html><body>'
+		'<h1>Hello</h1>'
+		'<button>Click me</button>'
+		'<a href="#x">link</a>'
+		'</body></html>',
+		content_type='text/html',
+	)
+	adapter = PlaywrightBrowserAdapter(playwright_page)
+	await adapter.goto(httpserver.url_for('/page'))
+
+	tree = await adapter.accessibility_snapshot_all_frames()
+	assert 'nodes' in tree
+	nodes = tree['nodes']
+	assert isinstance(nodes, list)
+	assert len(nodes) > 0
+
+	# Every node has the contract shape
+	for n in nodes:
+		assert 'nodeId' in n
+		assert 'parentId' in n          # may be None for roots
+		assert 'role'  in n and 'value' in n['role']
+		assert 'name'  in n and 'value' in n['name']
+		assert n.get('_synthetic') is True  # Playwright backend marker
+
+	# The button + link + heading should be in the AX tree
+	roles = {n['role'].get('value') for n in nodes if n['role'].get('value')}
+	# Headings / buttons / links should appear regardless of frame walking
+	assert {'heading', 'button', 'link'} & roles, f'expected core roles in {roles}'
+
+
 async def test_playwright_adapter_viewport_metrics(playwright_page, httpserver) -> None:
 	"""Phase-3 ABC extension: device_pixel_ratio + viewport_metrics
 	have natural cross-protocol meanings; both backends must implement."""
