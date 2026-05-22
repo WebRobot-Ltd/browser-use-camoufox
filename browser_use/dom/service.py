@@ -210,29 +210,23 @@ class DomService:
 		return enhanced_ax_node
 
 	async def _get_viewport_ratio(self, target_id: TargetID) -> float:
-		"""Get viewport dimensions, device pixel ratio, and scroll position using CDP."""
-		cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=target_id, focus=False)
+		"""Get the device-pixel-to-CSS-pixel ratio for the given target.
+
+		First consumer of :class:`~browser_use.browser.adapter.CdpBrowserAdapter`
+		— the operation has a clean cross-protocol meaning
+		(``window.devicePixelRatio``) so it belongs on the adapter
+		contract rather than the raw CDP path. Behaviour is unchanged vs.
+		the previous direct-CDP implementation: the adapter's CDP
+		backend issues the same ``Page.getLayoutMetrics`` call and
+		computes the same ratio, with a JS fallback below.
+		"""
+		from browser_use.browser.adapter import CdpBrowserAdapter
 
 		try:
-			# Get the layout metrics which includes the visual viewport
-			metrics = await cdp_session.cdp_client.send.Page.getLayoutMetrics(session_id=cdp_session.session_id)
-
-			visual_viewport = metrics.get('visualViewport', {})
-
-			# IMPORTANT: Use CSS viewport instead of device pixel viewport
-			# This fixes the coordinate mismatch on high-DPI displays
-			css_visual_viewport = metrics.get('cssVisualViewport', {})
-			css_layout_viewport = metrics.get('cssLayoutViewport', {})
-
-			# Use CSS pixels (what JavaScript sees) instead of device pixels
-			width = css_visual_viewport.get('clientWidth', css_layout_viewport.get('clientWidth', 1920.0))
-
-			# Calculate device pixel ratio
-			device_width = visual_viewport.get('clientWidth', width)
-			css_width = css_visual_viewport.get('clientWidth', width)
-			device_pixel_ratio = device_width / css_width if css_width > 0 else 1.0
-
-			return float(device_pixel_ratio)
+			adapter = await CdpBrowserAdapter.for_target(
+				self.browser_session, target_id, focus=False,
+			)
+			return await adapter.device_pixel_ratio()
 		except Exception as e:
 			self.logger.debug(f'Viewport size detection failed: {e}')
 			# Fallback to default viewport size

@@ -102,6 +102,21 @@ Outside this repo, the consumer is the `BrowserToolActor` in [`webrobot-etl-chat
 
 When the new adapter is general-purpose enough to live in this repo, send a PR adding it next to `CdpBrowserAdapter` and `PlaywrightBrowserAdapter` in [`browser_use/browser/adapter.py`](../browser_use/browser/adapter.py).
 
+## What stays out of the adapter
+
+Not every operation in this codebase belongs on `BrowserAdapter`. The adapter is for ops with a clean cross-protocol meaning — operations whose JS/Playwright/CDP shapes converge on the same conceptual API. Some operations are **intrinsically CDP-shaped** and porting them to the adapter would either be impossible or would force a least-common-denominator API that hides what makes them useful:
+
+| Stays CDP-direct | Why |
+| --- | --- |
+| `DOM.describeNode(backendNodeId)` / `Runtime.getProperties(objectId)` | CDP's protocol-internal handle types. Playwright doesn't expose them; emulating would require a parallel handle-cache that defeats the point. |
+| `DOMSnapshot.captureSnapshot` (high-volume flat snapshot of every node + computed style) | Playwright's API is one-element-at-a-time; faking it via `evaluate` is 100× slower. The op is genuinely a CDP-protocol primitive. |
+| `Page.getFrameTree` iteration over cross-origin iframes | OOPIF semantics in CDP are subtle; Playwright's `page.frames` doesn't expose the same target/session topology. |
+| `Page.lifecycleEvent` subscription for fine-grained load tracking | CDP-event-driven; the adapter's `wait_for_load_state` is best-effort polling. |
+
+Consumers that need these ops should keep talking to `cdp_session.cdp_client.send.<Domain>.<method>(...)` directly. The `CdpBrowserAdapter.for_target(session, target_id)` factory exists precisely to **coexist** with raw CDP access — DomService uses both inside the same method. The adapter handles what it can; the CDP path handles what it must.
+
+If you can't tell whether a new op belongs in the adapter, ask: *does the corresponding Playwright `Page` method exist, and does it mean the same thing?* If yes — adapter. If no — direct CDP.
+
 ## Extending the contract
 
 If your work needs an operation that's not in the ABC (say, `bounding_box(css_selector)` for visual highlighting), add it to **all three places**:

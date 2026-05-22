@@ -154,3 +154,30 @@ async def test_playwright_adapter_evaluate(playwright_page, httpserver) -> None:
 	assert await adapter.evaluate('1 + 1') == 2
 	# Function-with-arg form (Playwright convention).
 	assert await adapter.evaluate('(n) => n * 7', 6) == 42
+
+
+async def test_playwright_adapter_viewport_metrics(playwright_page, httpserver) -> None:
+	"""Phase-3 ABC extension: device_pixel_ratio + viewport_metrics
+	have natural cross-protocol meanings; both backends must implement."""
+	httpserver.expect_request('/scroll').respond_with_data(
+		'<html><body style="height: 4000px; width: 3000px;">scroll me</body></html>',
+		content_type='text/html',
+	)
+	adapter = PlaywrightBrowserAdapter(playwright_page)
+	await adapter.goto(httpserver.url_for('/scroll'))
+
+	dpr = await adapter.device_pixel_ratio()
+	assert isinstance(dpr, float)
+	assert dpr > 0
+
+	vm = await adapter.viewport_metrics()
+	# Contract: every key in the docstring is present and an int / float.
+	for key in ('width', 'height', 'scroll_x', 'scroll_y',
+	            'document_width', 'document_height', 'device_pixel_ratio'):
+		assert key in vm, f'viewport_metrics missing {key!r}'
+	assert vm['width']  > 0
+	assert vm['height'] > 0
+	# document_* must reflect the oversized body we served.
+	assert vm['document_width']  >= 3000
+	assert vm['document_height'] >= 4000
+	assert vm['device_pixel_ratio'] == dpr

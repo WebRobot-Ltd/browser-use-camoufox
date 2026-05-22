@@ -176,6 +176,35 @@ class BrowserAdapter(ABC):
 	@abstractmethod
 	async def set_viewport_size(self, width: int, height: int) -> None: ...
 
+	# ── Viewport / metrics ──
+
+	@abstractmethod
+	async def device_pixel_ratio(self) -> float:
+		"""``window.devicePixelRatio`` — the CSS-px-to-device-px ratio. 1.0
+		on standard displays, 2.0+ on HiDPI / Retina. Needed by any
+		consumer that converts between page coordinates and screen
+		coordinates (DOM service viewport math, screenshot overlays,
+		click coordinate dispatch)."""
+
+	@abstractmethod
+	async def viewport_metrics(self) -> dict[str, Any]:
+		"""Layout-level dimensions of the current viewport. Returns a dict
+		with at least::
+
+		    {
+		      'width':       int,    # CSS px — visual viewport width
+		      'height':      int,    # CSS px — visual viewport height
+		      'scroll_x':    int,    # CSS px — horizontal scroll offset
+		      'scroll_y':    int,    # CSS px — vertical scroll offset
+		      'document_width':  int,
+		      'document_height': int,
+		      'device_pixel_ratio': float,
+		    }
+
+		Backends MAY include additional keys (CDP's getLayoutMetrics
+		surfaces 6+ tiers, Playwright exposes fewer). Consumers should
+		only depend on the keys above and treat the rest as best-effort."""
+
 	# ── Media ──
 
 	@abstractmethod
@@ -228,22 +257,46 @@ class CdpBrowserAdapter(BrowserAdapter):
 	choose to use the adapter incrementally.
 	"""
 
-	def __init__(self, session: BrowserSession) -> None:
+	def __init__(self, session: BrowserSession,
+	             cdp_session_id: str | None = None) -> None:
+		"""Wrap a BrowserSession. When ``cdp_session_id`` is provided every
+		CDP call routes to that specific target (tab/iframe). When
+		``None``, calls route to ``session.current_session_id`` — the
+		"current tab" — which is the default for the agentic loop.
+
+		Use :meth:`for_target` to build a target-pinned instance from a
+		target_id (the way :class:`DomService` works with per-frame
+		sessions)."""
 		self._session = session
+		self._cdp_session_id = cdp_session_id
+
+	@classmethod
+	async def for_target(cls, session: BrowserSession, target_id: str,
+	                     *, focus: bool = False) -> CdpBrowserAdapter:
+		"""Build an adapter pinned to a specific CDP target (tab/iframe).
+
+		Used by consumers that walk multiple frames (DomService,
+		cross-frame action handlers). For "just talk to the current tab"
+		use the bare constructor."""
+		cdp_session = await session.get_or_create_cdp_session(
+			target_id=target_id, focus=focus,
+		)
+		return cls(session, cdp_session_id=cdp_session.session_id)
 
 	# Helpers ----------------------------------------------------------------
+
+	def _session_id(self) -> str:
+		"""Resolve the CDP session_id to route a command to. Pinned target
+		wins when set; otherwise tracks ``current_session_id``."""
+		return self._cdp_session_id or self._session.current_session_id
 
 	async def _eval(self, expression: str, *, return_by_value: bool = True) -> Any:
 		"""``Runtime.evaluate`` round-trip. Returns the unwrapped value."""
 		cdp = self._session.cdp_client
-		# Pick the current target session — BrowserSession owns the routing
-		# rules (active tab, frame). ``Runtime.evaluate`` runs in the
-		# session's main world.
-		session_id = self._session.current_session_id
 		result = await cdp.send.Runtime.evaluate(
 			params={'expression': expression, 'returnByValue': return_by_value,
 			        'awaitPromise': True},
-			session_id=session_id,
+			session_id=self._session_id(),
 		)
 		if result.get('exceptionDetails'):
 			detail = result['exceptionDetails']
@@ -260,10 +313,9 @@ class CdpBrowserAdapter(BrowserAdapter):
 	async def goto(self, url: str, *, wait_until: str = 'load',
 	               timeout_ms: int = 30_000) -> dict[str, Any]:
 		cdp = self._session.cdp_client
-		session_id = self._session.current_session_id
 		await cdp.send.Page.navigate(
 			params={'url': url, 'transitionType': 'typed'},
-			session_id=session_id,
+			session_id=self._session_id(),
 		)
 		await self.wait_for_load_state(wait_until, timeout_ms=timeout_ms)
 		return {'url': await self.url(), 'status': None}  # CDP doesn't surface main-frame status here
@@ -271,7 +323,7 @@ class CdpBrowserAdapter(BrowserAdapter):
 	async def reload(self, *, wait_until: str = 'load',
 	                 timeout_ms: int = 30_000) -> None:
 		cdp = self._session.cdp_client
-		await cdp.send.Page.reload(params={}, session_id=self._session.current_session_id)
+		await cdp.send.Page.reload(params={}, session_id=self._session_id())
 		await self.wait_for_load_state(wait_until, timeout_ms=timeout_ms)
 
 	async def url(self) -> str:
@@ -449,8 +501,75 @@ class CdpBrowserAdapter(BrowserAdapter):
 		cdp = self._session.cdp_client
 		await cdp.send.Emulation.setDeviceMetricsOverride(
 			params={'width': width, 'height': height, 'deviceScaleFactor': 1, 'mobile': False},
-			session_id=self._session.current_session_id,
+			session_id=self._session_id(),
 		)
+
+	# Viewport / metrics -----------------------------------------------------
+
+	async def device_pixel_ratio(self) -> float:
+		# CDP's Page.getLayoutMetrics returns visualViewport (device px) and
+		# cssVisualViewport (CSS px); their ratio is the DPR. We could also
+		# `Runtime.evaluate('window.devicePixelRatio')` but going through
+		# getLayoutMetrics is more reliable in detached frames where JS may
+		# not yet be ready.
+		try:
+			cdp = self._session.cdp_client
+			metrics = await cdp.send.Page.getLayoutMetrics(session_id=self._session_id())
+			visual = metrics.get('visualViewport', {})
+			css_visual = metrics.get('cssVisualViewport', {})
+			device_w = float(visual.get('clientWidth') or 0.0)
+			css_w = float(css_visual.get('clientWidth') or 0.0)
+			if css_w > 0 and device_w > 0:
+				return device_w / css_w
+		except Exception:
+			pass
+		# Fallback via JS — fires only if getLayoutMetrics is unavailable.
+		try:
+			return float(await self._eval('window.devicePixelRatio'))
+		except Exception:
+			return 1.0
+
+	async def viewport_metrics(self) -> dict[str, Any]:
+		cdp = self._session.cdp_client
+		try:
+			metrics = await cdp.send.Page.getLayoutMetrics(session_id=self._session_id())
+		except Exception:
+			# Fallback to JS-only viewport — no CDP available.
+			vm = await self._eval(
+				'(() => ({w: innerWidth, h: innerHeight, sx: scrollX, sy: scrollY, '
+				'dw: document.documentElement.scrollWidth, '
+				'dh: document.documentElement.scrollHeight, '
+				'dpr: window.devicePixelRatio}))()'
+			)
+			return {
+				'width':              int(vm.get('w', 0)),
+				'height':             int(vm.get('h', 0)),
+				'scroll_x':           int(vm.get('sx', 0)),
+				'scroll_y':           int(vm.get('sy', 0)),
+				'document_width':     int(vm.get('dw', 0)),
+				'document_height':    int(vm.get('dh', 0)),
+				'device_pixel_ratio': float(vm.get('dpr', 1.0)),
+			}
+		# CDP-only normalised shape. We expose only what we can guarantee
+		# the field exists across Chromium versions; backend-specific
+		# extras stay in metrics['_raw'] for advanced consumers.
+		css_visual = metrics.get('cssVisualViewport', {})
+		css_layout = metrics.get('cssLayoutViewport', {})
+		content_size = metrics.get('cssContentSize') or metrics.get('contentSize', {})
+		visual = metrics.get('visualViewport', {})
+		device_w = float(visual.get('clientWidth') or css_visual.get('clientWidth', 0))
+		css_w = float(css_visual.get('clientWidth', 0))
+		dpr = device_w / css_w if css_w > 0 else 1.0
+		return {
+			'width':              int(css_visual.get('clientWidth', css_layout.get('clientWidth', 0))),
+			'height':             int(css_visual.get('clientHeight', css_layout.get('clientHeight', 0))),
+			'scroll_x':           int(css_visual.get('pageX', 0)),
+			'scroll_y':           int(css_visual.get('pageY', 0)),
+			'document_width':     int(content_size.get('width', 0)),
+			'document_height':    int(content_size.get('height', 0)),
+			'device_pixel_ratio': dpr,
+			'_raw':               metrics,
+		}
 
 	# Media ------------------------------------------------------------------
 
@@ -459,7 +578,7 @@ class CdpBrowserAdapter(BrowserAdapter):
 		cdp = self._session.cdp_client
 		result = await cdp.send.Page.captureScreenshot(
 			params={'format': fmt, 'captureBeyondViewport': full_page},
-			session_id=self._session.current_session_id,
+			session_id=self._session_id(),
 		)
 		return base64.b64decode(result['data'])
 
@@ -470,7 +589,7 @@ class CdpBrowserAdapter(BrowserAdapter):
 		cdp = self._session.cdp_client
 		try:
 			result = await cdp.send.Accessibility.getFullAXTree(
-				params={}, session_id=self._session.current_session_id,
+				params={}, session_id=self._session_id(),
 			)
 		except Exception:
 			return None
@@ -487,14 +606,14 @@ class CdpBrowserAdapter(BrowserAdapter):
 		cdp = self._session.cdp_client
 		params = {'urls': urls} if urls else {}
 		result = await cdp.send.Network.getCookies(
-			params=params, session_id=self._session.current_session_id,
+			params=params, session_id=self._session_id(),
 		)
 		return result.get('cookies', [])
 
 	async def set_cookies(self, cookies: list[dict[str, Any]]) -> None:
 		cdp = self._session.cdp_client
 		await cdp.send.Network.setCookies(
-			params={'cookies': cookies}, session_id=self._session.current_session_id,
+			params={'cookies': cookies}, session_id=self._session_id(),
 		)
 
 	# Lifecycle --------------------------------------------------------------
@@ -596,6 +715,28 @@ class PlaywrightBrowserAdapter(BrowserAdapter):
 
 	async def set_viewport_size(self, width: int, height: int) -> None:
 		await self._page.set_viewport_size({'width': width, 'height': height})
+
+	# Viewport / metrics -----------------------------------------------------
+
+	async def device_pixel_ratio(self) -> float:
+		return float(await self._page.evaluate('() => window.devicePixelRatio'))
+
+	async def viewport_metrics(self) -> dict[str, Any]:
+		vm = await self._page.evaluate(
+			'() => ({w: innerWidth, h: innerHeight, sx: scrollX, sy: scrollY, '
+			'dw: document.documentElement.scrollWidth, '
+			'dh: document.documentElement.scrollHeight, '
+			'dpr: window.devicePixelRatio})'
+		)
+		return {
+			'width':              int(vm['w']),
+			'height':             int(vm['h']),
+			'scroll_x':           int(vm['sx']),
+			'scroll_y':           int(vm['sy']),
+			'document_width':     int(vm['dw']),
+			'document_height':    int(vm['dh']),
+			'device_pixel_ratio': float(vm['dpr']),
+		}
 
 	# Media ------------------------------------------------------------------
 
