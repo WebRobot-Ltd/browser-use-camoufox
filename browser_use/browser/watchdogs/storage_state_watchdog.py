@@ -90,6 +90,14 @@ class StorageStateWatchdog(BaseWatchdog):
 		if self._monitoring_task and not self._monitoring_task.done():
 			return
 
+		# BiDi: skip the periodic CDP-cookies poll. The Playwright path
+		# doesn't expose Network.responseReceivedExtraInfo for in-flight
+		# change detection; rely on the explicit Save event to flush.
+		conn = getattr(self.browser_session, '_connection', None)
+		if conn is not None and conn.backend == 'bidi':
+			self.logger.debug('[StorageStateWatchdog] (BiDi) periodic cookie poll skipped — Save events still honoured')
+			return
+
 		assert self.browser_session.cdp_client is not None
 
 		self._monitoring_task = create_task_with_error_handling(
@@ -164,8 +172,15 @@ class StorageStateWatchdog(BaseWatchdog):
 			self.logger.debug(f'[StorageStateWatchdog] Error comparing cookies: {e}')
 			return False
 
+	def _is_bidi(self) -> bool:
+		conn = getattr(self.browser_session, '_connection', None)
+		return bool(conn is not None and conn.backend == 'bidi')
+
 	async def _save_storage_state(self, path: str | None = None) -> None:
 		"""Save browser storage state to file."""
+		if self._is_bidi():
+			await self._save_storage_state_bidi(path)
+			return
 		async with self._save_lock:
 			# Check if CDP client is available
 			assert await self.browser_session.get_or_create_cdp_session(target_id=None)
@@ -232,6 +247,9 @@ class StorageStateWatchdog(BaseWatchdog):
 
 	async def _load_storage_state(self, path: str | None = None) -> None:
 		"""Load browser storage state from file."""
+		if self._is_bidi():
+			await self._load_storage_state_bidi(path)
+			return
 		if not self.browser_session.cdp_client:
 			self.logger.warning('[StorageStateWatchdog] No CDP client available for loading')
 			return
@@ -371,3 +389,91 @@ class StorageStateWatchdog(BaseWatchdog):
 			self.logger.debug(f'[StorageStateWatchdog] Added {len(cookies)} cookies')
 		except Exception as e:
 			self.logger.error(f'[StorageStateWatchdog] Failed to add cookies: {e}')
+
+	# ── BiDi (Playwright Firefox/Camoufox) helpers ──────────────────────────
+
+	async def _save_storage_state_bidi(self, path: str | None = None) -> None:
+		"""Save storage state via Playwright's BrowserContext.storage_state.
+
+		Playwright returns ``{cookies, origins}`` in the same shape the
+		CDP path serialises, so the on-disk JSON is interchangeable.
+		"""
+		async with self._save_lock:
+			save_path = path or self.browser_session.browser_profile.storage_state
+			if not save_path or isinstance(save_path, dict):
+				return
+			try:
+				conn = self.browser_session._connection
+				json_path = Path(str(save_path)).expanduser().resolve()
+				json_path.parent.mkdir(parents=True, exist_ok=True)
+
+				# Playwright writes the file directly when `path=…` is given.
+				# For atomic-write + backup parity with the CDP path we
+				# still go through the temp-file dance.
+				temp_path = json_path.with_suffix('.json.tmp')
+				state = await conn.context.storage_state()
+				# Merge with existing state if present.
+				if json_path.exists():
+					try:
+						existing = json.loads(json_path.read_text())
+						state = self._merge_storage_states(existing, state)
+					except Exception as e:
+						self.logger.error(f'[StorageStateWatchdog] (BiDi) merge failed: {e}')
+
+				temp_path.write_text(
+					json.dumps(state, indent=4, ensure_ascii=False), encoding='utf-8'
+				)
+				if json_path.exists():
+					json_path.replace(json_path.with_suffix('.json.bak'))
+				temp_path.replace(json_path)
+
+				self._last_cookie_state = list(state.get('cookies', []))
+				self.event_bus.dispatch(
+					StorageStateSavedEvent(
+						path=str(json_path),
+						cookies_count=len(state.get('cookies', [])),
+						origins_count=len(state.get('origins', [])),
+					)
+				)
+				self.logger.debug(
+					f'[StorageStateWatchdog] (BiDi) Saved storage state to {json_path}'
+				)
+			except Exception as e:
+				self.logger.error(f'[StorageStateWatchdog] (BiDi) save failed: {e}')
+
+	async def _load_storage_state_bidi(self, path: str | None = None) -> None:
+		"""Load storage state into the BiDi connection's BrowserContext.
+
+		Playwright's ``context.add_cookies`` accepts the same cookie
+		shape the JSON file uses (when produced by Playwright); for
+		files produced by the CDP path we coerce field names to the
+		Playwright convention.
+		"""
+		load_path = path or self.browser_session.browser_profile.storage_state
+		if isinstance(load_path, dict):
+			data = load_path
+		elif load_path:
+			json_path = Path(str(load_path)).expanduser().resolve()
+			if not json_path.exists():
+				self.logger.debug(f'[StorageStateWatchdog] (BiDi) {json_path} not present, skipping load')
+				return
+			try:
+				data = json.loads(json_path.read_text())
+			except Exception as e:
+				self.logger.error(f'[StorageStateWatchdog] (BiDi) parse failed: {e}')
+				return
+		else:
+			return
+
+		cookies = data.get('cookies') or []
+		if not cookies:
+			return
+		try:
+			conn = self.browser_session._connection
+			await conn.context.add_cookies(cookies)
+			self._last_cookie_state = list(cookies)
+			self.logger.debug(
+				f'[StorageStateWatchdog] (BiDi) Loaded {len(cookies)} cookies into context'
+			)
+		except Exception as e:
+			self.logger.error(f'[StorageStateWatchdog] (BiDi) add_cookies failed: {e}')

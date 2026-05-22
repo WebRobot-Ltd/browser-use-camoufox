@@ -62,6 +62,16 @@ class CrashWatchdog(BaseWatchdog):
 		"""Start monitoring when browser is connected."""
 		# logger.debug('[CrashWatchdog] Browser connected event received, beginning monitoring')
 
+		# BiDi backend: skip CDP-style periodic monitoring (uses Runtime.evaluate
+		# heartbeats that require a CDP session). Playwright's page.on('crash')
+		# + page.on('pageerror') events fire natively; we wire them on
+		# TabCreated. The browser-level periodic ping is unnecessary —
+		# Playwright detects subprocess death itself and Browser.is_connected
+		# flips to False, which our connection layer can poll if needed.
+		if self._is_bidi():
+			await self._attach_crash_handlers_bidi()
+			return
+
 		create_task_with_error_handling(
 			self._start_monitoring(), name='start_crash_monitoring', logger_instance=self.logger, suppress_exceptions=True
 		)
@@ -74,8 +84,54 @@ class CrashWatchdog(BaseWatchdog):
 
 	async def on_TabCreatedEvent(self, event: TabCreatedEvent) -> None:
 		"""Attach to new tab."""
+		if self._is_bidi():
+			await self._attach_crash_handlers_bidi()
+			return
 		assert self.browser_session.agent_focus_target_id is not None, 'No current target ID'
 		await self.attach_to_target(self.browser_session.agent_focus_target_id)
+
+	# ── BiDi (Playwright) helpers ───────────────────────────────────────────
+
+	def _is_bidi(self) -> bool:
+		conn = getattr(self.browser_session, '_connection', None)
+		return bool(conn is not None and conn.backend == 'bidi')
+
+	async def _attach_crash_handlers_bidi(self) -> None:
+		"""Wire ``page.on('crash')`` and ``page.on('pageerror')`` on the
+		current Playwright page. Idempotent via a marker attribute."""
+		try:
+			conn = self.browser_session._connection
+			page = conn.current_page
+		except Exception:
+			return  # connection not ready yet — TabCreatedEvent will fire later
+
+		marker = '__crash_watchdog_attached__'
+		if getattr(page, marker, False):
+			return
+
+		def _on_crash(p) -> None:
+			self.logger.error('[CrashWatchdog] (BiDi) Playwright reported a page crash')
+			# Match the CDP path's posture: schedule the recovery task,
+			# track it so cancellation propagates cleanly.
+			task = create_task_with_error_handling(
+				self._on_target_crash_cdp('bidi-page'),  # target_id placeholder
+				name='handle_bidi_page_crash',
+				logger_instance=self.logger,
+				suppress_exceptions=True,
+			)
+			self._cdp_event_tasks.add(task)
+			task.add_done_callback(lambda t: self._cdp_event_tasks.discard(t))
+
+		def _on_pageerror(err) -> None:
+			# Unlike crash, pageerror is a JS-level error — log only.
+			self.logger.debug(f'[CrashWatchdog] (BiDi) pageerror: {err}')
+
+		page.on('crash', _on_crash)
+		page.on('pageerror', _on_pageerror)
+		try:
+			setattr(page, marker, True)
+		except Exception:
+			pass
 
 	async def on_TabClosedEvent(self, event: TabClosedEvent) -> None:
 		"""Clean up tracking when tab closes."""
