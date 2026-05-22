@@ -1300,6 +1300,47 @@ class BrowserSession(BaseModel):
 		assert self._cdp_client_root is not None, 'CDP client not initialized - browser may not be connected yet'
 		return self._cdp_client_root
 
+	async def get_adapter(self, target_id: 'TargetID | None' = None) -> 'Any':
+		"""Return a :class:`BrowserAdapter` for the current (or specified)
+		target. Dispatches by connection backend:
+
+		  - ``cdp``: build a :class:`CdpBrowserAdapter` pinned to the
+		    target's CDP session. If ``target_id`` is None we use the
+		    focused page target.
+		  - ``bidi``: return a :class:`PlaywrightBrowserAdapter` wrapping
+		    the connection's current page. ``target_id`` is ignored on
+		    the BiDi backend (single-tab posture today; multi-tab via
+		    BiDi session-manager analog comes later).
+
+		Watchdogs that have an adapter-grade equivalent for their CDP
+		ops use this method to stay backend-portable. Watchdogs whose
+		operations are CDP-shaped continue using
+		:meth:`get_or_create_cdp_session` directly and gracefully no-op
+		on the BiDi backend.
+		"""
+		from browser_use.browser.adapter import CdpBrowserAdapter, PlaywrightBrowserAdapter
+
+		# BiDi backend — return the Playwright adapter wrapping the
+		# connection's current page. No notion of target_id on this side
+		# yet; single-page posture documented in
+		# :class:`BidiBrowserConnection`.
+		if self._connection is not None and self._connection.backend == 'bidi':
+			return PlaywrightBrowserAdapter(self._connection.current_page)
+
+		# CDP backend (default).
+		if target_id is None:
+			focused = self.get_focused_target()
+			if focused is not None:
+				target_id = focused.target_id
+			else:
+				# Fall back to the last available page target — same
+				# heuristic the screenshot watchdog uses today.
+				pages = self.get_page_targets()
+				if not pages:
+					raise RuntimeError('get_adapter(): no page targets available')
+				target_id = pages[-1].target_id
+		return await CdpBrowserAdapter.for_target(self, target_id, focus=False)
+
 	async def new_page(self, url: str | None = None) -> 'Page':
 		"""Create a new page (tab)."""
 		from cdp_use.cdp.target.commands import CreateTargetParameters

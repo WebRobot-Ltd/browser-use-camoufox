@@ -158,7 +158,10 @@ class BidiBrowserConnection(BrowserConnection):
 	1. ``__init__`` records inputs but does NOT touch the network.
 	2. :meth:`start` enters async-land: starts the Playwright runtime
 	   if not already running, connects to ``ws_endpoint`` if given,
-	   stores the resulting ``Browser`` handle.
+	   stores the resulting ``Browser`` handle, opens a default
+	   :class:`BrowserContext` and one initial :class:`Page`. These
+	   become the "current tab" the watchdogs can access via
+	   :attr:`current_page` until multi-tab tracking lands.
 	"""
 
 	backend = 'bidi'
@@ -180,6 +183,11 @@ class BidiBrowserConnection(BrowserConnection):
 		self._ws_endpoint = ws_endpoint
 		self._owns_playwright = playwright is None and browser is None
 		self._started = browser is not None
+		# Default context + page — populated by start(). Single-tab posture
+		# for the first Firefox iteration; multi-tab discovery becomes
+		# the BiDi analog of SessionManager when needed.
+		self._context: PlaywrightContext | None = None
+		self._page: PlaywrightPage | None = None
 
 	@property
 	def browser(self) -> PlaywrightBrowser:
@@ -196,18 +204,48 @@ class BidiBrowserConnection(BrowserConnection):
 		return self._playwright
 
 	async def start(self) -> None:
-		if self._started and self._browser is not None:
+		if self._started and self._browser is not None and self._page is not None:
 			return
 		from playwright.async_api import async_playwright
 
 		if self._playwright is None:
 			self._playwright = await async_playwright().start()
-		assert self._ws_endpoint is not None, 'ws_endpoint required when no Browser injected'
-		self._browser = await self._playwright.firefox.connect(self._ws_endpoint)
+
+		if self._browser is None:
+			assert self._ws_endpoint is not None, 'ws_endpoint required when no Browser injected'
+			self._browser = await self._playwright.firefox.connect(self._ws_endpoint)
+
+		# Always have at least one context + page available. If the
+		# caller injected an already-running Browser with its own
+		# contexts/pages we prefer those; otherwise we create defaults.
+		if self._browser.contexts:
+			self._context = self._browser.contexts[0]
+		else:
+			self._context = await self._browser.new_context()
+		if self._context.pages:
+			self._page = self._context.pages[0]
+		else:
+			self._page = await self._context.new_page()
+
 		self._started = True
 
 	async def stop(self) -> None:
-		# Order: browser → playwright runtime. Skip what we don't own.
+		# Order: page → context → browser → playwright runtime. Each step
+		# is best-effort and never raises. We close the context only when
+		# we created it (i.e. when starting from a fresh Browser without
+		# pre-existing contexts).
+		if self._page is not None:
+			try:
+				await self._page.close()
+			except Exception:
+				pass
+			self._page = None
+		if self._context is not None:
+			try:
+				await self._context.close()
+			except Exception:
+				pass
+			self._context = None
 		if self._browser is not None:
 			try:
 				await self._browser.close()
@@ -228,6 +266,27 @@ class BidiBrowserConnection(BrowserConnection):
 			return False
 		# Playwright Browser exposes `is_connected()` for liveness.
 		return bool(self._browser.is_connected())
+
+	# ── Page / context accessors (used by watchdogs going through the
+	# Playwright path; CDP-shaped watchdogs continue using cdp_client). ─
+
+	@property
+	def context(self) -> PlaywrightContext:
+		"""Default :class:`BrowserContext`. Raises if connection isn't started."""
+		if self._context is None:
+			raise RuntimeError('BidiBrowserConnection: start() not called yet')
+		return self._context
+
+	@property
+	def current_page(self) -> PlaywrightPage:
+		"""The "active tab" :class:`Page` watchdogs interact with. Until
+		multi-tab tracking lands this is the single default page opened
+		by :meth:`start`. Watchdogs that need a different page MUST
+		switch the context's active page first (Playwright's
+		``page.bring_to_front``) then re-fetch."""
+		if self._page is None:
+			raise RuntimeError('BidiBrowserConnection: no active page (start() not called?)')
+		return self._page
 
 
 # ── Factory helpers ──────────────────────────────────────────────────────────
