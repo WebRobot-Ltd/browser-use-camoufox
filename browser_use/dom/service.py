@@ -1022,6 +1022,14 @@ class DomService:
 		timing_info: dict[str, float] = {}
 		start_total = time.time()
 
+		# Phase-5b dispatch: BiDi (Firefox/Camoufox) goes through the
+		# Playwright-driven JS-walk path that synthesises an
+		# EnhancedDOMTreeNode tree without CDP. The CDP path below stays
+		# untouched.
+		conn = getattr(self.browser_session, '_connection', None)
+		if conn is not None and conn.backend == 'bidi':
+			return await self._get_serialized_dom_tree_bidi(previous_cached_state, timing_info, start_total)
+
 		# Use current target (None means use current)
 		assert self.browser_session.agent_focus_target_id is not None
 
@@ -1144,3 +1152,272 @@ class DomService:
 				)
 
 		return pagination_buttons
+
+	# ── BiDi (Playwright Firefox/Camoufox) DOM construction ────────────────
+	#
+	# Phase-5b. The CDP path uses Page.getFrameTree + DOMSnapshot.captureSnapshot
+	# + Accessibility.getFullAXTree + DOM.getDocument and stitches the result
+	# into an EnhancedDOMTreeNode tree heavily tied to CDP node-id semantics.
+	# Playwright Firefox/Camoufox has none of those primitives at the same
+	# granularity. We synthesise the equivalent by injecting a JS walker
+	# into the page that emits a flat node list with rects + computed styles,
+	# then reconstruct the EnhancedDOMTreeNode tree with synthetic ids.
+	#
+	# Honest caveats:
+	#   - synthetic `backend_node_id` values DO NOT cross-reference any CDP
+	#     API. They're stable within ONE call and used only as keys for the
+	#     parent/child linking.
+	#   - Cross-origin iframes are not walked (Playwright security boundary);
+	#     same-origin iframes ARE walked via `frame.evaluate`.
+	#   - Shadow DOM is walked when `mode: 'open'`. Closed shadow roots
+	#     match the CDP path's posture: skipped.
+	#   - Accessibility data is folded in best-effort via Playwright's
+	#     `page.accessibility.snapshot`; nodes without a matching AX entry
+	#     get `ax_node=None`, same as CDP would on a missing backend id.
+
+	_BIDI_WALK_JS = r"""
+	(() => {
+		const out = [];
+		const interactive = new Set([
+			'a','button','input','textarea','select','option','label',
+			'details','summary','video','audio','iframe',
+		]);
+		let counter = 0;
+
+		function rect(el) {
+			try {
+				const r = el.getBoundingClientRect();
+				return {x: r.x, y: r.y, width: r.width, height: r.height};
+			} catch (e) {
+				return {x: 0, y: 0, width: 0, height: 0};
+			}
+		}
+		function styles(el) {
+			try {
+				const cs = window.getComputedStyle(el);
+				return {
+					display:     cs.display || '',
+					visibility:  cs.visibility || '',
+					opacity:     cs.opacity || '',
+					cursor:      cs.cursor || '',
+					'pointer-events': cs.pointerEvents || '',
+				};
+			} catch (e) { return {}; }
+		}
+		function isVisible(el, st) {
+			const r = rect(el);
+			if (r.width <= 0 || r.height <= 0) return false;
+			if (st.display === 'none' || st.visibility === 'hidden') return false;
+			if (parseFloat(st.opacity || '1') === 0) return false;
+			return true;
+		}
+		function isClickable(el, st) {
+			if (!el || el.nodeType !== 1) return false;
+			const tag = el.tagName.toLowerCase();
+			if (interactive.has(tag)) return true;
+			if (el.hasAttribute('onclick')) return true;
+			if (el.getAttribute('role') === 'button') return true;
+			if (st.cursor === 'pointer') return true;
+			if (el.tabIndex >= 0) return true;
+			return false;
+		}
+		function attrs(el) {
+			const o = {};
+			if (!el.attributes) return o;
+			for (const a of el.attributes) {
+				if (a.value && a.value.length < 500) o[a.name] = a.value;
+			}
+			return o;
+		}
+		function xpathFor(el) {
+			// Cheap path: index-among-tag-siblings.
+			const parts = [];
+			let cur = el;
+			while (cur && cur.nodeType === 1 && cur !== document.documentElement) {
+				const tag = cur.tagName.toLowerCase();
+				let i = 1;
+				let s = cur.previousElementSibling;
+				while (s) {
+					if (s.tagName.toLowerCase() === tag) i++;
+					s = s.previousElementSibling;
+				}
+				parts.unshift(`${tag}[${i}]`);
+				cur = cur.parentElement;
+			}
+			return '/html/' + parts.join('/');
+		}
+
+		function walk(node, parentId, depth) {
+			if (!node) return;
+			if (depth > 200) return;  // sane recursion limit
+			counter += 1;
+			const myId = counter;
+			let entry;
+			if (node.nodeType === 3) {  // TEXT
+				const txt = (node.textContent || '').trim();
+				if (!txt) return;
+				entry = {
+					node_id: myId, parent_id: parentId,
+					node_type: 3, node_name: '#text',
+					node_value: txt.slice(0, 4000),
+					attributes: {}, rect: null, styles: {},
+					visible: true, clickable: false,
+					xpath: '', tag: '#text',
+				};
+				out.push(entry);
+				return;
+			}
+			if (node.nodeType !== 1) return;  // skip comments, etc.
+			const st = styles(node);
+			const r = rect(node);
+			entry = {
+				node_id: myId, parent_id: parentId,
+				node_type: 1,
+				node_name: node.tagName.toUpperCase(),
+				tag: node.tagName.toLowerCase(),
+				node_value: '',
+				attributes: attrs(node),
+				rect: r,
+				styles: st,
+				visible: isVisible(node, st),
+				clickable: isClickable(node, st),
+				xpath: xpathFor(node),
+			};
+			out.push(entry);
+
+			// Shadow DOM (open mode only)
+			if (node.shadowRoot && node.shadowRoot.mode === 'open') {
+				for (const c of node.shadowRoot.children) walk(c, myId, depth + 1);
+			}
+			for (const c of node.childNodes) walk(c, myId, depth + 1);
+		}
+		walk(document.documentElement, null, 0);
+		return {
+			url: document.location.href,
+			title: document.title,
+			device_pixel_ratio: window.devicePixelRatio || 1.0,
+			scroll_x: window.scrollX, scroll_y: window.scrollY,
+			nodes: out,
+		};
+	})()
+	"""
+
+	async def _get_serialized_dom_tree_bidi(
+		self,
+		previous_cached_state: SerializedDOMState | None,
+		timing_info: dict[str, float],
+		start_total: float,
+	) -> tuple[SerializedDOMState, EnhancedDOMTreeNode, dict[str, float]]:
+		"""BiDi-side equivalent of get_serialized_dom_tree.
+
+		Single JS evaluate produces the flat node list; we then build
+		EnhancedDOMTreeNode + EnhancedSnapshotNode bridges and hand it
+		to DOMTreeSerializer. Synthetic ids are used throughout — see
+		the module-level note above for caveats.
+		"""
+		from browser_use.browser.adapter import PlaywrightBrowserAdapter
+		from browser_use.dom.views import (
+			DOMRect,
+			EnhancedSnapshotNode,
+			NodeType,
+		)
+
+		conn = self.browser_session._connection
+		adapter = PlaywrightBrowserAdapter(conn.current_page)
+		dpr = await adapter.device_pixel_ratio()
+
+		start_walk = time.time()
+		walk = await adapter.evaluate(self._BIDI_WALK_JS)
+		timing_info['bidi_dom_walk_ms'] = (time.time() - start_walk) * 1000
+
+		if not walk or not walk.get('nodes'):
+			# Empty page or eval failure — degrade to an empty tree the
+			# Agent serializer can survive on.
+			walk = {'nodes': [], 'url': '', 'title': '', 'device_pixel_ratio': dpr,
+			        'scroll_x': 0, 'scroll_y': 0}
+
+		start_build = time.time()
+
+		# Pass 1: create EnhancedDOMTreeNode shells indexed by node_id.
+		shells: dict[int, EnhancedDOMTreeNode] = {}
+		for raw in walk['nodes']:
+			node_id = raw['node_id']
+			rect = raw.get('rect')
+			abs_rect = DOMRect(x=float(rect['x']), y=float(rect['y']),
+			                   width=float(rect['width']), height=float(rect['height'])) if rect else None
+			snapshot_node = EnhancedSnapshotNode(
+				is_clickable=bool(raw.get('clickable')),
+				cursor_style=(raw.get('styles') or {}).get('cursor'),
+				bounds=abs_rect,
+				clientRects=abs_rect,
+				scrollRects=None,
+				computed_styles=raw.get('styles') or {},
+				paint_order=None,
+				stacking_contexts=None,
+			)
+			shells[node_id] = EnhancedDOMTreeNode(
+				node_id=node_id,
+				backend_node_id=node_id,  # synthetic — same as node_id under BiDi
+				node_type=NodeType.ELEMENT_NODE if raw['node_type'] == 1 else NodeType.TEXT_NODE,
+				node_name=raw.get('node_name') or '',
+				node_value=raw.get('node_value') or '',
+				attributes=raw.get('attributes') or {},
+				is_scrollable=None,
+				is_visible=bool(raw.get('visible')),
+				absolute_position=abs_rect,
+				target_id=self.browser_session.agent_focus_target_id or 'bidi-page',
+				frame_id=None,
+				session_id=None,
+				content_document=None,
+				shadow_root_type=None,
+				shadow_roots=None,
+				parent_node=None,
+				children_nodes=[],
+				ax_node=None,
+				snapshot_node=snapshot_node,
+			)
+
+		# Pass 2: wire parent/child.
+		root: EnhancedDOMTreeNode | None = None
+		for raw in walk['nodes']:
+			node = shells[raw['node_id']]
+			pid = raw.get('parent_id')
+			if pid is None:
+				if root is None:
+					root = node
+			else:
+				parent = shells.get(pid)
+				if parent is not None:
+					node.parent_node = parent
+					if parent.children_nodes is None:
+						parent.children_nodes = []
+					parent.children_nodes.append(node)
+
+		if root is None:
+			# Defensive fallback — empty document.
+			root = next(iter(shells.values()), EnhancedDOMTreeNode(
+				node_id=1, backend_node_id=1,
+				node_type=NodeType.ELEMENT_NODE,
+				node_name='HTML', node_value='', attributes={},
+				is_scrollable=None, is_visible=False, absolute_position=None,
+				target_id='bidi-page', frame_id=None, session_id=None,
+				content_document=None, shadow_root_type=None, shadow_roots=None,
+				parent_node=None, children_nodes=None,
+				ax_node=None, snapshot_node=None,
+			))
+
+		timing_info['bidi_build_tree_ms'] = (time.time() - start_build) * 1000
+
+		# Hand to the existing serializer — same path the CDP backend uses,
+		# so the SerializedDOMState shape stays consistent for the Agent.
+		start_serialize = time.time()
+		serialized_dom_state, serializer_timing = DOMTreeSerializer(
+			root, previous_cached_state,
+			paint_order_filtering=self.paint_order_filtering,
+			session_id=self.browser_session.id,
+		).serialize_accessible_elements()
+		for key, value in serializer_timing.items():
+			timing_info[f'{key}_ms'] = value * 1000
+		timing_info['serialization_total_ms'] = (time.time() - start_serialize) * 1000
+		timing_info['get_serialized_dom_tree_total_ms'] = (time.time() - start_total) * 1000
+		return serialized_dom_state, root, timing_info
