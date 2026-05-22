@@ -525,6 +525,15 @@ class BrowserSession(BaseModel):
 
 	# Mutable private state shared between watchdogs
 	_cdp_client_root: CDPClient | None = PrivateAttr(default=None)
+	# Phase-5a foundation: the protocol-agnostic connection. CDP path:
+	# wraps _cdp_client_root after the existing connect logic builds it.
+	# Firefox/BiDi path: wraps a Playwright Browser obtained via
+	# firefox.connect(ws_url). Stays in sync with _cdp_client_root for
+	# back-compat — the legacy `cdp_client` accessor below still works
+	# on the CDP backend, and the BiDi backend leaves it as None (any
+	# legacy code that dereferences it on Firefox raises a clear error
+	# instead of mis-dispatching).
+	_connection: Any = PrivateAttr(default=None)  # BrowserConnection
 	_connection_lock: Any = PrivateAttr(default=None)  # asyncio.Lock for preventing concurrent connections
 
 	# PUBLIC: SessionManager instance (OWNS all targets and sessions)
@@ -620,15 +629,25 @@ class BrowserSession(BaseModel):
 			await self.session_manager.clear()
 			self.session_manager = None
 
-		# Close CDP WebSocket before clearing to prevent stale event handlers
+		# Close CDP WebSocket before clearing to prevent stale event handlers.
+		# Phase-5a: when the protocol connection wrapper exists (and isn't
+		# just aliasing _cdp_client_root) we also stop it — covers the
+		# BiDi path where _cdp_client_root is never set.
 		if self._cdp_client_root:
 			try:
 				await self._cdp_client_root.stop()
 				self.logger.debug('Closed CDP client WebSocket during reset')
 			except Exception as e:
 				self.logger.debug(f'Error closing CDP client during reset: {e}')
+		elif self._connection is not None:
+			try:
+				await self._connection.stop()
+				self.logger.debug(f'Closed {self._connection.backend} connection during reset')
+			except Exception as e:
+				self.logger.debug(f'Error closing connection during reset: {e}')
 
 		self._cdp_client_root = None  # type: ignore
+		self._connection = None
 		self._cached_browser_state_summary = None
 		self._cached_selector_map.clear()
 		self._downloaded_files.clear()
@@ -1729,10 +1748,48 @@ class BrowserSession(BaseModel):
 		self._watchdogs_attached = True
 
 	async def connect(self, cdp_url: str | None = None) -> Self:
-		"""Connect to a remote chromium-based browser via CDP using cdp-use.
+		"""Connect to a remote browser.
+
+		Dispatches by ``browser_profile.browser_type`` (Phase-5a):
+
+		  - CHROMIUM (default): legacy CDP connect via cdp_use. The
+		    historical behaviour — every existing user of this method
+		    sees zero change.
+		  - FIREFOX: Playwright BiDi connect. The ``cdp_url`` argument
+		    is interpreted as a Playwright WS endpoint (returned by
+		    :class:`FirefoxPlaywrightEngine.launch`); we wrap it in a
+		    :class:`BidiBrowserConnection` and return early. The watchdog
+		    and downstream session machinery that *still* assume CDP
+		    will fail loudly when they try to dereference ``cdp_client``
+		    — that's the Phase-5b/c/d backlog.
 
 		This MUST succeed or the browser is unusable. Fails hard on any error.
 		"""
+		# Firefox / BiDi branch — short-circuit the CDP-specific setup.
+		# We deliberately keep the rest of this method below identical
+		# to the pre-Phase-5a code so the Chromium path is bit-identical.
+		from browser_use.browser.profile import BrowserType
+
+		if self.browser_profile.browser_type == BrowserType.FIREFOX:
+			from browser_use.browser.connection import BidiBrowserConnection
+
+			ws_url = cdp_url or self.cdp_url
+			if not ws_url:
+				raise RuntimeError(
+					'Cannot setup Firefox/BiDi connection without a WS endpoint '
+					'(expected from FirefoxPlaywrightEngine.launch)'
+				)
+			self.browser_profile.cdp_url = ws_url
+			self._connection = BidiBrowserConnection(ws_endpoint=ws_url)
+			await self._connection.start()
+			self.logger.info(
+				f'🦊 Connected via Playwright Firefox BiDi: {ws_url}. '
+				'Note: most watchdogs still assume CDP — Agent.run() will '
+				'fail downstream until Phase-5b/c/d port them. The page-'
+				'level adapter API works end-to-end through '
+				'PlaywrightBrowserAdapter against this connection.'
+			)
+			return self
 
 		self.browser_profile.cdp_url = cdp_url or self.cdp_url
 		if not self.cdp_url:
@@ -1796,6 +1853,18 @@ class BrowserSession(BaseModel):
 			)
 			assert self._cdp_client_root is not None
 			await self._cdp_client_root.start()
+			# Mirror the CDP client behind the protocol-agnostic Connection
+			# (Phase 5a). _connection wraps the SAME client object — no new
+			# socket, no extra round-trips. As watchdogs migrate to
+			# `self.browser_session.connection.<op>` the cdp_client direct
+			# access can go away; until then both pointers coexist.
+			from browser_use.browser.connection import CdpBrowserConnection
+			self._connection = CdpBrowserConnection(self._cdp_client_root)
+			# Don't call self._connection.start() — it would re-start the
+			# CDPClient. The wrapper acknowledges the existing started
+			# state via its `_started=False` default, but we want
+			# `is_open` to reflect reality, so flip the flag manually.
+			self._connection._started = True  # type: ignore[attr-defined]
 
 			# Initialize event-driven session manager FIRST (before enabling autoAttach)
 			# SessionManager will:

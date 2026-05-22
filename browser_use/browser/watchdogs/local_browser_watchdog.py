@@ -91,15 +91,35 @@ class LocalBrowserWatchdog(BaseWatchdog):
 
 	@observe_debug(ignore_input=True, ignore_output=True, name='launch_browser_process')
 	async def _launch_browser(self, max_retries: int = 3) -> tuple[psutil.Process, str]:
-		"""Launch browser process and return (process, cdp_url).
+		"""Launch browser process and return (process, connect_url).
+
+		Dispatches by ``profile.browser_type`` (Phase-5a):
+		  - CHROMIUM (default): legacy CDP launch path below — every
+		    existing user sees zero change.
+		  - FIREFOX: delegate to :class:`FirefoxPlaywrightEngine` for a
+		    real Playwright Firefox launch; returns ``(process, ws_url)``
+		    where ``ws_url`` is a BiDi WebSocket endpoint. The session's
+		    :meth:`connect` knows how to consume that path.
 
 		Handles launch errors by falling back to temporary directories if needed.
 
 		Returns:
-			Tuple of (psutil.Process, cdp_url)
+			Tuple of (psutil.Process, connect_url) — a CDP HTTP URL for
+			Chromium, a Playwright WS URL for Firefox.
 		"""
 		# Keep track of original user_data_dir to restore if needed
 		profile = self.browser_session.browser_profile
+
+		# Phase-5a dispatch: route FIREFOX profiles to the Playwright
+		# Firefox engine. The Chromium path below stays untouched.
+		from browser_use.browser.profile import BrowserType
+
+		if profile.browser_type == BrowserType.FIREFOX:
+			from browser_use.browser.engine import FirefoxPlaywrightEngine
+
+			engine = FirefoxPlaywrightEngine()
+			return await engine.launch(self)
+
 		self._original_user_data_dir = str(profile.user_data_dir) if profile.user_data_dir else None
 		self._temp_dirs_to_cleanup = []
 
