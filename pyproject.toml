@@ -1,8 +1,11 @@
 [project]
-name = "browser-use"
-description = "Make websites accessible for AI agents"
-authors = [{ name = "Gregor Zunic" }]
-version = "0.12.7"
+name = "browser-use-camoufox"
+description = "WebRobot's Camoufox / Firefox-compat fork of browser-use. Python import path stays `browser_use` for source compatibility with upstream."
+authors = [
+    { name = "Gregor Zunic" },
+    { name = "WebRobot fork maintainers" },
+]
+version = "0.12.7+webrobot.1"
 readme = "README.md"
 requires-python = ">=3.11,<4.0"
 classifiers = [
