@@ -53,6 +53,11 @@ class AboutBlankWatchdog(BaseWatchdog):
 		"""Check tabs when a new tab is created."""
 		# logger.debug(f'[AboutBlankWatchdog] ➕ New tab created: {event.url}')
 
+		# BiDi path: no multi-tab tracking yet; the DVD screensaver is
+		# decorative and not load-bearing for the Agent loop. Skip.
+		if self._is_bidi():
+			return
+
 		# If an about:blank tab was created, show DVD screensaver on all about:blank tabs
 		if event.url == 'about:blank':
 			await self._show_dvd_screensaver_on_about_blank_tabs()
@@ -61,6 +66,12 @@ class AboutBlankWatchdog(BaseWatchdog):
 		"""Check tabs when a tab is closed and proactively create about:blank if needed."""
 		# Don't create new tabs if browser is shutting down
 		if self._stopping:
+			return
+
+		# BiDi path: ensure the connection still has at least one page open;
+		# if not, open a fresh about:blank via the Playwright context.
+		if self._is_bidi():
+			await self._on_tab_closed_bidi()
 			return
 
 		# Don't attempt CDP operations if the WebSocket is dead — dispatching
@@ -84,6 +95,42 @@ class AboutBlankWatchdog(BaseWatchdog):
 		else:
 			# Multiple tabs exist, check after close
 			await self._check_and_ensure_about_blank_tab()
+
+	# ── BiDi (Playwright) helpers ───────────────────────────────────────────
+
+	def _is_bidi(self) -> bool:
+		"""Return True when the session is on a Playwright/BiDi backend."""
+		conn = getattr(self.browser_session, '_connection', None)
+		return bool(conn is not None and conn.backend == 'bidi')
+
+	async def _on_tab_closed_bidi(self) -> None:
+		"""BiDi equivalent of the CDP last-tab recovery path.
+
+		Multi-tab tracking on BiDi is not yet implemented (single-page
+		posture inherited from :class:`BidiBrowserConnection`). What we
+		guarantee here is the *functional* contract of the CDP path:
+		after a tab close the browser still has at least one page open.
+		"""
+		conn = self.browser_session._connection
+		try:
+			pages = conn.context.pages
+		except Exception:
+			pages = []
+
+		if len(pages) >= 1:
+			return
+
+		self.logger.debug('[AboutBlankWatchdog] (BiDi) no pages left, opening about:blank')
+		try:
+			page = await conn.context.new_page()
+			await page.goto('about:blank', wait_until='domcontentloaded')
+			# Update the connection's current_page pointer so subsequent
+			# watchdog operations target the new page instead of the
+			# closed one. Private setattr is intentional — public API
+			# would force the caller to know the current_page is mutable.
+			conn._page = page  # type: ignore[attr-defined]
+		except Exception as e:
+			self.logger.error(f'[AboutBlankWatchdog] (BiDi) failed to recover blank page: {e}')
 
 	async def attach_to_target(self, target_id: TargetID) -> None:
 		"""AboutBlankWatchdog doesn't monitor individual targets."""

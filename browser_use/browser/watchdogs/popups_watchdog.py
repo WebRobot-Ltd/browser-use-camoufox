@@ -25,7 +25,19 @@ class PopupsWatchdog(BaseWatchdog):
 		self.logger.debug(f'🚀 PopupsWatchdog initialized with browser_session={self.browser_session}, ID={id(self)}')
 
 	async def on_TabCreatedEvent(self, event: TabCreatedEvent) -> None:
-		"""Set up JavaScript dialog handling when a new tab is created."""
+		"""Set up JavaScript dialog handling when a new tab is created.
+
+		Dual-mode dispatch (Phase-5b): on the BiDi backend we attach a
+		Playwright ``page.on('dialog', …)`` handler to the connection's
+		current page instead of CDP's ``Page.javascriptDialogOpening``
+		registration. Same operational contract — JS alerts/confirms get
+		auto-accepted, prompts dismissed, beforeunload accepted.
+		"""
+		conn = getattr(self.browser_session, '_connection', None)
+		if conn is not None and conn.backend == 'bidi':
+			await self._on_tab_created_bidi()
+			return
+
 		target_id = event.target_id
 		self.logger.debug(f'🎯 PopupsWatchdog received TabCreatedEvent for target {target_id}')
 
@@ -143,3 +155,51 @@ class PopupsWatchdog(BaseWatchdog):
 
 		except Exception as e:
 			self.logger.warning(f'Failed to set up popup handling for tab {target_id}: {e}')
+
+	# ── BiDi (Playwright) helpers ───────────────────────────────────────────
+
+	async def _on_tab_created_bidi(self) -> None:
+		"""Register a Playwright ``page.on('dialog', …)`` handler.
+
+		Playwright auto-binds the handler to the page; once attached it
+		fires for every alert/confirm/prompt/beforeunload until the
+		page is closed. Idempotent: re-attaching to a page that already
+		has our handler is a no-op (we tag the page object).
+		"""
+		conn = self.browser_session._connection
+		try:
+			page = conn.current_page
+		except Exception as e:
+			self.logger.debug(f'[PopupsWatchdog] (BiDi) no current page yet: {e}')
+			return
+
+		# Tag the page so we don't double-register if TabCreatedEvent
+		# fires more than once for the same page.
+		marker = '__popups_watchdog_attached__'
+		if getattr(page, marker, False):
+			return
+
+		async def _handle(dialog) -> None:
+			try:
+				dialog_type = dialog.type
+				message = dialog.message or ''
+				if message:
+					formatted = f'[{dialog_type}] {message}'
+					self.browser_session._closed_popup_messages.append(formatted)
+				# Same semantics as the CDP path: accept alert / confirm /
+				# beforeunload, dismiss prompt.
+				if dialog_type in ('alert', 'confirm', 'beforeunload'):
+					await dialog.accept()
+					self.logger.info(f"🔔 (BiDi) {dialog_type} dialog: '{message[:100]}' - accepted")
+				else:
+					await dialog.dismiss()
+					self.logger.info(f"🔔 (BiDi) {dialog_type} dialog: '{message[:100]}' - dismissed")
+			except Exception as e:
+				self.logger.error(f'[PopupsWatchdog] (BiDi) handler error: {type(e).__name__}: {e}')
+
+		page.on('dialog', _handle)
+		try:
+			setattr(page, marker, True)
+		except Exception:
+			pass  # some Playwright page implementations are slot-bound
+		self.logger.debug('[PopupsWatchdog] (BiDi) page.on("dialog") registered')

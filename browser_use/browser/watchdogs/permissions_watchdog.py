@@ -28,6 +28,18 @@ class PermissionsWatchdog(BaseWatchdog):
 			self.logger.debug('No permissions to grant')
 			return
 
+		# Phase-5b dispatch. Playwright permissions API takes the same
+		# permission strings (clipboardReadWrite, notifications, …) but
+		# lives on BrowserContext.grant_permissions, not on Browser.
+		conn = getattr(self.browser_session, '_connection', None)
+		if conn is not None and conn.backend == 'bidi':
+			try:
+				await conn.context.grant_permissions(permissions)
+				self.logger.debug(f'✅ (BiDi) Granted permissions: {permissions}')
+			except Exception as e:
+				self.logger.error(f'❌ (BiDi) Failed to grant permissions: {e}')
+			return
+
 		self.logger.debug(f'🔓 Granting browser permissions: {permissions}')
 
 		try:
