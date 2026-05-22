@@ -335,7 +335,15 @@ class DefaultActionWatchdog(BaseWatchdog):
 
 	@observe_debug(ignore_input=True, ignore_output=True, name='click_element_event')
 	async def on_ClickElementEvent(self, event: ClickElementEvent) -> dict | None:
-		"""Handle click request with CDP. Automatically waits for file downloads if triggered."""
+		"""Handle click request. Dispatches by connection backend; CDP path
+		is bit-identical to the pre-Phase-5b implementation."""
+		# Phase-5b dispatch: BiDi (Firefox/Camoufox) path uses the
+		# Playwright page directly via XPath locator. The complex CDP-
+		# specific helpers below (download detection, print-button
+		# handling, framework-event triggering) are CDP-only for now —
+		# Phase-5c will incrementally port them.
+		if self._is_bidi():
+			return await self._on_click_bidi(event)
 		try:
 			# Check if session is alive before attempting any operations
 			if not self.browser_session.agent_focus_target_id:
@@ -449,7 +457,9 @@ class DefaultActionWatchdog(BaseWatchdog):
 			raise
 
 	async def on_TypeTextEvent(self, event: TypeTextEvent) -> dict | None:
-		"""Handle text input request with CDP."""
+		"""Handle text input request. Dispatches by connection backend."""
+		if self._is_bidi():
+			return await self._on_type_text_bidi(event)
 		try:
 			# Use the provided node
 			element_node = event.node
@@ -511,6 +521,11 @@ class DefaultActionWatchdog(BaseWatchdog):
 			raise
 
 	async def on_ScrollEvent(self, event: ScrollEvent) -> None:
+		if self._is_bidi():
+			return await self._on_scroll_bidi(event)
+		return await self._on_scroll_cdp(event)
+
+	async def _on_scroll_cdp(self, event: ScrollEvent) -> None:
 		"""Handle scroll request with CDP."""
 		# Check if we have a current target for scrolling
 		if not self.browser_session.agent_focus_target_id:
@@ -2339,6 +2354,11 @@ class DefaultActionWatchdog(BaseWatchdog):
 		return cdp_session.session_id
 
 	async def on_GoBackEvent(self, event: GoBackEvent) -> None:
+		if self._is_bidi():
+			return await self._on_go_back_bidi(event)
+		return await self._on_go_back_cdp(event)
+
+	async def _on_go_back_cdp(self, event: GoBackEvent) -> None:
 		"""Handle navigate back request with CDP."""
 		cdp_session = await self.browser_session.get_or_create_cdp_session()
 		try:
@@ -2369,6 +2389,11 @@ class DefaultActionWatchdog(BaseWatchdog):
 			raise
 
 	async def on_GoForwardEvent(self, event: GoForwardEvent) -> None:
+		if self._is_bidi():
+			return await self._on_go_forward_bidi(event)
+		return await self._on_go_forward_cdp(event)
+
+	async def _on_go_forward_cdp(self, event: GoForwardEvent) -> None:
 		"""Handle navigate forward request with CDP."""
 		cdp_session = await self.browser_session.get_or_create_cdp_session()
 		try:
@@ -2397,6 +2422,11 @@ class DefaultActionWatchdog(BaseWatchdog):
 			raise
 
 	async def on_RefreshEvent(self, event: RefreshEvent) -> None:
+		if self._is_bidi():
+			return await self._on_refresh_bidi(event)
+		return await self._on_refresh_cdp(event)
+
+	async def _on_refresh_cdp(self, event: RefreshEvent) -> None:
 		"""Handle target refresh request with CDP."""
 		cdp_session = await self.browser_session.get_or_create_cdp_session()
 		try:
@@ -2444,6 +2474,11 @@ class DefaultActionWatchdog(BaseWatchdog):
 		await cdp_session.cdp_client.send.Input.dispatchKeyEvent(params=params, session_id=cdp_session.session_id)
 
 	async def on_SendKeysEvent(self, event: SendKeysEvent) -> None:
+		if self._is_bidi():
+			return await self._on_send_keys_bidi(event)
+		return await self._on_send_keys_cdp(event)
+
+	async def _on_send_keys_cdp(self, event: SendKeysEvent) -> None:
 		"""Handle send keys request with CDP."""
 		cdp_session = await self.browser_session.get_or_create_cdp_session(focus=True)
 		try:
@@ -3700,3 +3735,114 @@ class DefaultActionWatchdog(BaseWatchdog):
 			error_msg = f'Failed to select dropdown option "{target_text}" for element {index_for_logging}: {str(e)}'
 			self.logger.error(error_msg)
 			raise ValueError(error_msg) from e
+
+	# ── BiDi (Playwright Firefox/Camoufox) dispatch helpers ─────────────────
+	#
+	# These handlers route the same event payloads as the CDP path through
+	# the Playwright page on the current BidiBrowserConnection. The CDP-
+	# specific helpers (download detection via Network events, framework-
+	# event triggering, print-button special-casing) are intentionally
+	# absent here — they get layered back in as we extend the adapter and
+	# add the Playwright-side equivalents.
+
+	def _is_bidi(self) -> bool:
+		conn = getattr(self.browser_session, '_connection', None)
+		return bool(conn is not None and conn.backend == 'bidi')
+
+	def _bidi_page(self):
+		"""Return the Playwright Page on the active BiDi connection.
+
+		Raises a clean RuntimeError when the connection isn't ready —
+		better than letting an AttributeError trickle up the call chain.
+		"""
+		conn = self.browser_session._connection
+		try:
+			return conn.current_page
+		except Exception as e:
+			raise RuntimeError(f'no BiDi current_page: {e}')
+
+	def _bidi_locator(self, element_node):
+		"""Build a Playwright locator from an EnhancedDOMTreeNode.
+
+		Uses the node's xpath (every EnhancedDOMTreeNode carries one,
+		derived from the DOM walk) — Playwright accepts XPath via the
+		``xpath=`` selector engine.
+		"""
+		page = self._bidi_page()
+		xpath = getattr(element_node, 'xpath', None)
+		if not xpath:
+			raise RuntimeError('element_node has no xpath; cannot build Playwright locator')
+		# Playwright's "xpath=" prefix maps to the XPath engine.
+		return page.locator(f'xpath={xpath}').first
+
+	async def _on_click_bidi(self, event):
+		element_node = event.node
+		try:
+			locator = self._bidi_locator(element_node)
+			await locator.click(timeout=10_000)
+			self.logger.debug(
+				f'🖱️ (BiDi) Clicked {element_node.node_name} (xpath={element_node.xpath[:80]})'
+			)
+			return None
+		except Exception as e:
+			self.logger.error(f'[DefaultActionWatchdog] (BiDi) click failed: {e}')
+			raise
+
+	async def _on_type_text_bidi(self, event):
+		element_node = event.node
+		text = event.text
+		try:
+			if not getattr(element_node, 'backend_node_id', None):
+				# "Type to whatever has focus" — use page keyboard.
+				await self._bidi_page().keyboard.type(text)
+				return None
+			locator = self._bidi_locator(element_node)
+			# fill() clears + types atomically; matches the CDP _set_value
+			# / _input_text_element_node_impl posture for input/textarea.
+			await locator.fill(text, timeout=10_000)
+			return None
+		except Exception as e:
+			self.logger.error(f'[DefaultActionWatchdog] (BiDi) type_text failed: {e}')
+			raise
+
+	async def _on_scroll_bidi(self, event):
+		page = self._bidi_page()
+		pixels = int(getattr(event, 'pixels', 0) or 0)
+		direction = getattr(event, 'direction', 'down')
+		dy = pixels if direction in ('down', None) else -pixels
+		try:
+			await page.evaluate(f'window.scrollBy(0, {dy})')
+		except Exception as e:
+			self.logger.error(f'[DefaultActionWatchdog] (BiDi) scroll failed: {e}')
+			raise
+
+	async def _on_go_back_bidi(self, event):
+		try:
+			await self._bidi_page().go_back(wait_until='domcontentloaded')
+		except Exception as e:
+			self.logger.error(f'[DefaultActionWatchdog] (BiDi) go_back failed: {e}')
+			raise
+
+	async def _on_go_forward_bidi(self, event):
+		try:
+			await self._bidi_page().go_forward(wait_until='domcontentloaded')
+		except Exception as e:
+			self.logger.error(f'[DefaultActionWatchdog] (BiDi) go_forward failed: {e}')
+			raise
+
+	async def _on_refresh_bidi(self, event):
+		try:
+			await self._bidi_page().reload(wait_until='domcontentloaded')
+		except Exception as e:
+			self.logger.error(f'[DefaultActionWatchdog] (BiDi) refresh failed: {e}')
+			raise
+
+	async def _on_send_keys_bidi(self, event):
+		# Playwright's keyboard.press matches the SendKeysEvent contract:
+		# event.keys is a single key name ("Enter", "ArrowDown", "a") or a
+		# combination ("Control+a"). Playwright understands both forms.
+		try:
+			await self._bidi_page().keyboard.press(event.keys)
+		except Exception as e:
+			self.logger.error(f'[DefaultActionWatchdog] (BiDi) send_keys failed: {e}')
+			raise
