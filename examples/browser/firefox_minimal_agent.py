@@ -41,15 +41,30 @@ Install (once)::
     pip install camoufox[playwright]
     python -m camoufox fetch
 
-Set ONE provider env var::
+Pick ONE provider — set the matching env var(s)::
 
+    # WebRobot LLM endpoint (canonical for this project — Groq → OpenAI →
+    # Anthropic → TogetherAI auto-cascade managed server-side).
+    export WEBROBOT_API_ENDPOINT=https://api.webrobot.eu       # base URL
+    # The WebRobot demo endpoints don't need a credential; for /api/llm/infer
+    # specifically the server resolves credentials from the platform's cloud
+    # vault. Setting WEBROBOT_API_KEY only attributes usage for analytics.
+    export WEBROBOT_LLM_PROVIDER=groq                          # optional hint
+
+    # OR a direct provider (browser-use's bundled clients):
     export OPENAI_API_KEY=sk-...
-    # or:
     export ANTHROPIC_API_KEY=sk-ant-...
-    # or:
     export GROQ_API_KEY=gsk-...
-    # or:
     export GOOGLE_API_KEY=...
+
+Provider auto-pick order (when ``--model`` is not given): WebRobot endpoint
+first (since it exists in every WebRobot deploy), then OpenAI, Anthropic,
+Groq, Google. To force a specific provider use ``--model``, e.g.::
+
+    --model webrobot/groq               # WebRobot endpoint with provider hint
+    --model openai/gpt-4o-mini
+    --model anthropic/claude-3-5-haiku-latest
+    --model groq/llama-3.3-70b-versatile
 
 Run with a goal::
 
@@ -77,9 +92,13 @@ import re
 import sys
 from typing import Any
 
+import httpx
+
 from browser_use.browser.adapter import PlaywrightBrowserAdapter
 from browser_use.browser.engine import FirefoxPlaywrightEngine
-from browser_use.llm.messages import SystemMessage, UserMessage
+from browser_use.llm.base import BaseChatModel
+from browser_use.llm.messages import AssistantMessage, BaseMessage, SystemMessage, UserMessage
+from browser_use.llm.views import ChatInvokeCompletion
 
 
 # ── Prompt ───────────────────────────────────────────────────────────────────
@@ -106,6 +125,130 @@ Selector tips:
 """
 
 
+# ── WebRobot LLM endpoint client ─────────────────────────────────────────────
+
+
+class _WebRobotChat(BaseChatModel):
+	"""Thin BaseChatModel client for the WebRobot LLM endpoint.
+
+	Endpoint contract (mirrors what the agentic-runtime BrowserToolActor
+	uses)::
+
+	    POST {base}/api/webrobot/api/llm/infer
+	    body: {"prompt": str, "systemPrompt": str?, "provider": str?}
+	    response: {"result": str, ...}
+
+	Auto-cascades Groq → OpenAI → Anthropic → TogetherAI server-side, so
+	the client doesn't need provider-specific config beyond an optional
+	``provider`` hint. Credentials live in the server's cloud vault; the
+	client only sends ``Authorization`` if WEBROBOT_API_KEY is set
+	(strictly for org-level usage attribution, not for auth on the demo
+	endpoint).
+	"""
+
+	# Public BaseChatModel-required attrs.
+	model: str = 'webrobot'
+
+	def __init__(self, *, base_url: str, provider: str | None = None,
+	             api_key: str | None = None, timeout_s: float = 60.0) -> None:
+		# BaseChatModel is a Protocol-shaped pydantic-compatible parent; we
+		# don't call super().__init__() because there's no concrete base
+		# state to initialise. Attributes are class-level + instance-level.
+		self.base_url = base_url.rstrip('/')
+		self.provider_hint = provider
+		self.api_key = api_key
+		self.timeout_s = timeout_s
+		self.model = f'webrobot/{provider}' if provider else 'webrobot'
+
+	@property
+	def provider(self) -> str:
+		return 'webrobot'
+
+	@property
+	def name(self) -> str:
+		return self.model
+
+	async def ainvoke(
+		self,
+		messages: list[BaseMessage],
+		output_format: type | None = None,
+		**kwargs: Any,
+	) -> ChatInvokeCompletion[str]:
+		# Flatten messages into prompt + systemPrompt. Our endpoint
+		# accepts only those two fields; multi-turn history is folded
+		# into `prompt` as a transcript so the LLM still sees the
+		# conversation shape.
+		system_parts: list[str] = []
+		convo_parts: list[str] = []
+		for m in messages:
+			content = _message_content_to_text(m)
+			if isinstance(m, SystemMessage):
+				system_parts.append(content)
+			elif isinstance(m, AssistantMessage):
+				convo_parts.append(f'Assistant: {content}')
+			else:
+				# UserMessage or unknown — treat as user input.
+				convo_parts.append(content if isinstance(m, UserMessage) else f'{m.__class__.__name__}: {content}')
+
+		payload: dict[str, Any] = {'prompt': '\n\n'.join(convo_parts)}
+		if system_parts:
+			payload['systemPrompt'] = '\n\n'.join(system_parts)
+		if self.provider_hint:
+			payload['provider'] = self.provider_hint
+
+		headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+		if self.api_key:
+			headers['Authorization'] = (
+				self.api_key if self.api_key.lower().startswith(('bearer ', 'apikey '))
+				else f'ApiKey {self.api_key}'
+			)
+
+		# NOTE: the path is /api/webrobot/api/llm/infer — Tomcat mounts
+		# Jersey at /api/* so the @Path("/webrobot/api/llm") resource
+		# lives at /api/webrobot/api/llm. Same convention as every other
+		# WebRobot endpoint.
+		url = f'{self.base_url}/api/webrobot/api/llm/infer'
+		async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s, connect=15.0)) as client:
+			r = await client.post(url, json=payload, headers=headers)
+			r.raise_for_status()
+			data = r.json()
+
+		text = data.get('result') or data.get('text') or ''
+		if not text:
+			raise RuntimeError(f'WebRobot LLM returned no `result`: {data}')
+
+		# output_format is currently ignored — the WebRobot endpoint
+		# doesn't enforce structured output. Callers that need it can
+		# json.loads(completion) themselves; the MinimalAgent already
+		# does so via _parse_action().
+		return ChatInvokeCompletion(completion=text, usage=None)
+
+
+def _message_content_to_text(m: BaseMessage) -> str:
+	"""Flatten a BaseMessage's content into a plain string.
+
+	Browser-use messages carry content as either ``str`` or a list of
+	content-part dicts (text / image / refusal). For our endpoint we
+	keep only the text parts.
+	"""
+	content = getattr(m, 'content', None)
+	if isinstance(content, str):
+		return content
+	if isinstance(content, list):
+		parts: list[str] = []
+		for p in content:
+			# Pydantic content parts have .type + .text fields.
+			if isinstance(p, dict):
+				if p.get('type') == 'text' and 'text' in p:
+					parts.append(p['text'])
+			else:
+				txt = getattr(p, 'text', None)
+				if txt:
+					parts.append(txt)
+		return '\n'.join(parts)
+	return '' if content is None else str(content)
+
+
 # ── LLM picker ───────────────────────────────────────────────────────────────
 
 
@@ -115,13 +258,25 @@ def pick_llm(model_hint: str | None) -> Any:
 	break the script when another provider is selected."""
 	if model_hint:
 		# Explicit override: parse `provider/model` or `provider:model`.
+		# For `webrobot`, the second part is interpreted as the optional
+		# provider hint (groq/openai/anthropic/togetherai), since the
+		# concept of "model" lives server-side under the WebRobot endpoint.
 		m = re.match(r'(?P<provider>[a-z]+)[/:](?P<model>.+)', model_hint)
 		if not m:
-			raise ValueError(f'--model must look like provider/model, got {model_hint!r}')
-		provider, model = m.group('provider'), m.group('model')
+			# Allow bare `webrobot` (no provider hint).
+			if model_hint.strip().lower() == 'webrobot':
+				provider, model = 'webrobot', ''
+			else:
+				raise ValueError(f'--model must look like provider/model, got {model_hint!r}')
+		else:
+			provider, model = m.group('provider'), m.group('model')
 	else:
-		# Auto-pick by first available env var.
-		if os.environ.get('OPENAI_API_KEY'):
+		# Auto-pick — WebRobot endpoint first when its base URL is set
+		# (canonical path for this project). Then individual providers
+		# by env var.
+		if os.environ.get('WEBROBOT_API_ENDPOINT'):
+			provider, model = 'webrobot',  os.environ.get('WEBROBOT_LLM_PROVIDER') or ''
+		elif os.environ.get('OPENAI_API_KEY'):
 			provider, model = 'openai',    'gpt-4o-mini'
 		elif os.environ.get('ANTHROPIC_API_KEY'):
 			provider, model = 'anthropic', 'claude-3-5-haiku-latest'
@@ -131,10 +286,18 @@ def pick_llm(model_hint: str | None) -> Any:
 			provider, model = 'google',    'gemini-2.0-flash'
 		else:
 			raise RuntimeError(
-				'No LLM provider env var set. Export one of OPENAI_API_KEY, '
-				'ANTHROPIC_API_KEY, GROQ_API_KEY, GOOGLE_API_KEY, or pass --model.'
+				'No LLM provider configured. Set WEBROBOT_API_ENDPOINT (recommended), '
+				'or export one of OPENAI_API_KEY / ANTHROPIC_API_KEY / GROQ_API_KEY / '
+				'GOOGLE_API_KEY, or pass --model.'
 			)
 
+	if provider == 'webrobot':
+		base = os.environ.get('WEBROBOT_API_ENDPOINT', 'https://api.webrobot.eu')
+		return _WebRobotChat(
+			base_url=base,
+			provider=(model or os.environ.get('WEBROBOT_LLM_PROVIDER') or None),
+			api_key=os.environ.get('WEBROBOT_API_KEY'),
+		)
 	if provider == 'openai':
 		from browser_use.llm.openai.chat import ChatOpenAI
 		return ChatOpenAI(model=model)
