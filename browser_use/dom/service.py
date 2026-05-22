@@ -353,54 +353,56 @@ class DomService:
 		return await adapter.accessibility_snapshot_all_frames()  # type: ignore[return-value]
 
 	async def _get_all_trees(self, target_id: TargetID) -> TargetAllTrees:
-		cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=target_id, focus=False)
+		# Hybrid consumption (see docs/ADAPTERS.md): adapter-grade ops
+		# (plain Runtime.evaluate returning JSON) go through
+		# CdpBrowserAdapter; CDP-shaped ops below (Runtime.getProperties
+		# walks of object handles, DOMSnapshot.captureSnapshot,
+		# DOM.getDocument) keep the raw cdp_session because they have no
+		# cross-protocol meaning.
+		from browser_use.browser.adapter import CdpBrowserAdapter
 
-		# Wait for the page to be ready first
+		cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=target_id, focus=False)
+		adapter = CdpBrowserAdapter(self.browser_session, cdp_session_id=cdp_session.session_id)
+
+		# Wait for the page to be ready first (best-effort; failure is non-fatal).
 		try:
-			ready_state = await cdp_session.cdp_client.send.Runtime.evaluate(
-				params={'expression': 'document.readyState'}, session_id=cdp_session.session_id
-			)
-		except Exception as e:
-			pass  # Page might not be ready yet
+			await adapter.evaluate('document.readyState')
+		except Exception:
+			pass
 		# DEBUG: Log before capturing snapshot
 		self.logger.debug(f'🔍 DEBUG: Capturing DOM snapshot for target {target_id}')
 
-		# Get actual scroll positions for all iframes before capturing snapshot
+		# Get actual scroll positions for all iframes before capturing snapshot.
+		# The JS body returns plain JSON — adapter.evaluate is sufficient.
 		start_iframe_scroll = time.time()
 		iframe_scroll_positions = {}
 		try:
-			scroll_result = await cdp_session.cdp_client.send.Runtime.evaluate(
-				params={
-					'expression': """
-					(() => {
-						const scrollData = {};
-						const iframes = document.querySelectorAll('iframe');
-						iframes.forEach((iframe, index) => {
-							try {
-								const doc = iframe.contentDocument || iframe.contentWindow.document;
-								if (doc) {
-									scrollData[index] = {
-										scrollTop: doc.documentElement.scrollTop || doc.body.scrollTop || 0,
-										scrollLeft: doc.documentElement.scrollLeft || doc.body.scrollLeft || 0
-									};
-								}
-							} catch (e) {
-								// Cross-origin iframe, can't access
+			iframe_scroll_positions = await adapter.evaluate(
+				"""
+				(() => {
+					const scrollData = {};
+					const iframes = document.querySelectorAll('iframe');
+					iframes.forEach((iframe, index) => {
+						try {
+							const doc = iframe.contentDocument || iframe.contentWindow.document;
+							if (doc) {
+								scrollData[index] = {
+									scrollTop: doc.documentElement.scrollTop || doc.body.scrollTop || 0,
+									scrollLeft: doc.documentElement.scrollLeft || doc.body.scrollLeft || 0
+								};
 							}
-						});
-						return scrollData;
-					})()
-					""",
-					'returnByValue': True,
-				},
-				session_id=cdp_session.session_id,
-			)
-			if scroll_result and 'result' in scroll_result and 'value' in scroll_result['result']:
-				iframe_scroll_positions = scroll_result['result']['value']
-				for idx, scroll_data in iframe_scroll_positions.items():
-					self.logger.debug(
-						f'🔍 DEBUG: Iframe {idx} actual scroll position - scrollTop={scroll_data.get("scrollTop", 0)}, scrollLeft={scroll_data.get("scrollLeft", 0)}'
-					)
+						} catch (e) {
+							// Cross-origin iframe, can't access
+						}
+					});
+					return scrollData;
+				})()
+				"""
+			) or {}
+			for idx, scroll_data in iframe_scroll_positions.items():
+				self.logger.debug(
+					f'🔍 DEBUG: Iframe {idx} actual scroll position - scrollTop={scroll_data.get("scrollTop", 0)}, scrollLeft={scroll_data.get("scrollLeft", 0)}'
+				)
 		except Exception as e:
 			self.logger.debug(f'Failed to get iframe scroll positions: {e}')
 		iframe_scroll_ms = (time.time() - start_iframe_scroll) * 1000

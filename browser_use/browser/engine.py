@@ -12,15 +12,35 @@ This module defines:
   - :class:`ChromiumCdpEngine` — wraps the existing CDP-based launch path
     by delegating back to :class:`~browser_use.browser.watchdogs.local_browser_watchdog.LocalBrowserWatchdog`'s
     private helper. No behaviour change vs. previous releases.
-  - :class:`FirefoxPlaywrightEngine` — STUB. Raises :class:`NotImplementedError`
-    with a useful message until the Firefox launch + session paths land.
+  - :class:`FirefoxPlaywrightEngine` — real Playwright Firefox launcher.
+    Spawns a Firefox process (stock Firefox or a Camoufox binary via
+    ``executable_path``) and surfaces the BiDi WebSocket URL via
+    :meth:`launch`. For local tests and adapter-driven scripts use
+    :meth:`launch_with_adapter` — it returns a Playwright page already
+    wrapped in :class:`~browser_use.browser.adapter.PlaywrightBrowserAdapter`.
   - :func:`get_engine` — factory that resolves :class:`~browser_use.browser.profile.BrowserType`
     into a concrete engine.
 
-The session and watchdog code stays CDP-end-to-end for the CHROMIUM path
-in this phase; Phase-3 will start extracting the actual Chromium launch
-logic out of :class:`LocalBrowserWatchdog` into :class:`ChromiumCdpEngine`,
-and Phase-4 will plug Playwright Firefox into :class:`FirefoxPlaywrightEngine`.
+Status note. The Firefox **launch** is wired and works; the Firefox
+**session** path is NOT wired into :class:`LocalBrowserWatchdog` yet,
+because :mod:`browser_use.browser.session` only speaks CDP today —
+the BiDi WS URL the engine returns is non-consumable by the CDP
+session bring-up. That's the Phase-5 split. Until then, Firefox is
+usable via :meth:`FirefoxPlaywrightEngine.launch_with_adapter` (and
+through the BrowserToolActor in the agentic-runtime, which never
+went through the watchdog in the first place).
+
+Quick local test:
+
+    from browser_use.browser.engine import FirefoxPlaywrightEngine
+
+    handle = await FirefoxPlaywrightEngine.launch_with_adapter(headless=True)
+    try:
+        await handle['adapter'].goto('https://books.toscrape.com')
+        html = await handle['adapter'].content()
+        print(html[:200])
+    finally:
+        await handle['teardown']()
 """
 
 from __future__ import annotations
@@ -83,26 +103,117 @@ class ChromiumCdpEngine(BrowserEngine):
 class FirefoxPlaywrightEngine(BrowserEngine):
 	"""Firefox-family launch path — stock Firefox + Camoufox.
 
-	**Status: not implemented.** Phase-4 will land Playwright Firefox
-	launching here (subprocess via ``playwright.firefox.launch_server()``,
-	BiDi WebSocket URL surfaced to the session layer). For now this engine
-	exists so that the factory has something to return and config
-	validation can reject impossible combinations early instead of failing
-	deep inside a CDP call.
+	Spawns a Firefox subprocess via Playwright Python's
+	``firefox.launch_server`` (for the ABC :meth:`launch` contract that
+	returns a connectable URL) or ``firefox.launch`` (for the
+	:meth:`launch_with_adapter` convenience that returns a wrapped Page).
+
+	The Camoufox binary is a Firefox build — drop its path into
+	``profile.executable_path`` (or the ``executable_path=`` keyword)
+	and the engine launches Camoufox transparently.
+
+	**Session integration is not wired yet.** The BiDi WebSocket URL
+	returned by :meth:`launch` is the right protocol for any client
+	speaking Playwright's wire format, but :mod:`browser_use.browser.session`
+	is CDP-only and can't consume it. Going through
+	:class:`LocalBrowserWatchdog` on a FIREFOX profile would launch the
+	browser successfully then fail to connect downstream. That's
+	Phase-5. Until then, use :meth:`launch_with_adapter` for any code
+	that needs to drive a Firefox/Camoufox page through
+	:class:`~browser_use.browser.adapter.PlaywrightBrowserAdapter`
+	without the legacy session stack.
 	"""
 
 	name = 'firefox'
 
 	async def launch(self, watchdog: LocalBrowserWatchdog) -> tuple[psutil.Process, str]:
-		raise NotImplementedError(
-			'BrowserType.FIREFOX is not yet wired into the launch path. '
-			'The data model accepts it (see BrowserProfile.browser_type), '
-			'but the session/watchdog stack still assumes CDP end-to-end. '
-			"Track progress on the `firefox-compat` branch. For an immediate "
-			'Camoufox-driven selector-grounding workflow, use the '
-			'BrowserToolActor in the webrobot-etl-chatbot-server agentic-runtime '
-			'(thin Playwright-Firefox loop, not a full browser-use port).'
+		"""ABC-conformant launch. Reads launch flags from the
+		watchdog's :class:`~browser_use.browser.profile.BrowserProfile`
+		and returns ``(process, ws_endpoint)`` — a BiDi WebSocket URL a
+		Playwright client can ``connect()`` to.
+		"""
+		from playwright.async_api import async_playwright
+
+		profile = watchdog.browser_session.browser_profile
+		pw = await async_playwright().start()
+		server = await pw.firefox.launch_server(
+			headless=bool(profile.headless),
+			executable_path=str(profile.executable_path) if profile.executable_path else None,
+			args=list(profile.args or []),
 		)
+		pid = getattr(server, 'process', None)
+		pid = pid.pid if pid is not None else None
+		if pid is None:
+			# Playwright should always surface the subprocess pid, but
+			# defend against the corner case so the upper layer gets a
+			# clean error instead of an AttributeError surfaced from
+			# `psutil.Process(None)`.
+			raise RuntimeError('playwright.firefox.launch_server did not expose a process pid')
+		return psutil.Process(pid), server.ws_endpoint
+
+	@staticmethod
+	async def launch_with_adapter(
+		*,
+		headless: bool = True,
+		executable_path: str | None = None,
+		args: list[str] | None = None,
+		proxy: dict | None = None,
+	) -> dict:
+		"""End-to-end local launch: spawn Firefox, open a context + page,
+		wrap the page in :class:`PlaywrightBrowserAdapter`, return a
+		dict with everything callers need plus a teardown coroutine.
+
+		Returned shape::
+
+		    {
+		      'process':  psutil.Process | None,
+		      'browser':  playwright.async_api.Browser,
+		      'page':     playwright.async_api.Page,
+		      'adapter':  PlaywrightBrowserAdapter,
+		      'teardown': Callable[[], Awaitable[None]],
+		    }
+
+		The caller must ``await handle['teardown']()`` to release the
+		browser + playwright runtime. Designed for scripts, notebooks,
+		and the kind of local-test we use to validate the fork against
+		Camoufox before plumbing into the full Agent loop.
+		"""
+		from playwright.async_api import async_playwright
+
+		from browser_use.browser.adapter import PlaywrightBrowserAdapter
+
+		pw = await async_playwright().start()
+		browser = await pw.firefox.launch(
+			headless=headless,
+			executable_path=executable_path,
+			args=args or [],
+			proxy=proxy,
+		)
+		context = await browser.new_context()
+		page = await context.new_page()
+
+		# Playwright's Browser exposes `.process` as the asyncio subprocess
+		# handle on local launches (None for `connect()`-ed remotes).
+		raw_proc = getattr(browser, 'process', None)
+		process = psutil.Process(raw_proc.pid) if raw_proc is not None else None
+		adapter = PlaywrightBrowserAdapter(page)
+
+		async def _teardown() -> None:
+			# Order matters: close page → context → browser → pw runtime.
+			# Each step is best-effort; we never raise from teardown.
+			for step in (page.close, context.close, browser.close, pw.stop):
+				try:
+					await step()
+				except Exception:
+					pass
+
+		return {
+			'process':  process,
+			'browser':  browser,
+			'page':     page,
+			'adapter':  adapter,
+			'teardown': _teardown,
+		}
 
 
 # ── Factory ──────────────────────────────────────────────────────────────────
