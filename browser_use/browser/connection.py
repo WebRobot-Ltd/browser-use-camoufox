@@ -172,6 +172,7 @@ class BidiBrowserConnection(BrowserConnection):
 		browser: PlaywrightBrowser | None = None,
 		playwright: Playwright | None = None,
 		ws_endpoint: str | None = None,
+		proxy: dict | None = None,
 	) -> None:
 		if browser is None and ws_endpoint is None:
 			raise ValueError(
@@ -181,6 +182,10 @@ class BidiBrowserConnection(BrowserConnection):
 		self._browser: PlaywrightBrowser | None = browser
 		self._playwright: Playwright | None = playwright
 		self._ws_endpoint = ws_endpoint
+		# Per-CONTEXT proxy (geo / egress IP), applied CLIENT-SIDE: even when we
+		# connect to a remote Camoufox over the ws, Playwright Firefox honours a
+		# proxy passed to new_context(). dict form: {server, username, password, bypass}.
+		self._proxy = proxy
 		self._owns_playwright = playwright is None and browser is None
 		self._started = browser is not None
 		# Default context + page — populated by start(). Single-tab posture
@@ -215,10 +220,13 @@ class BidiBrowserConnection(BrowserConnection):
 			assert self._ws_endpoint is not None, 'ws_endpoint required when no Browser injected'
 			self._browser = await self._playwright.firefox.connect(self._ws_endpoint)
 
-		# Always have at least one context + page available. If the
-		# caller injected an already-running Browser with its own
-		# contexts/pages we prefer those; otherwise we create defaults.
-		if self._browser.contexts:
+		# Context selection. With a proxy we MUST create a fresh context that
+		# carries it (geo/egress IP is per-context) — the default context that
+		# Camoufox already opened can't be re-proxied after the fact. Without a
+		# proxy, reuse the existing context (cheaper) or make a default one.
+		if self._proxy:
+			self._context = await self._browser.new_context(proxy=self._proxy)
+		elif self._browser.contexts:
 			self._context = self._browser.contexts[0]
 		else:
 			self._context = await self._browser.new_context()

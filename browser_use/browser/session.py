@@ -1901,7 +1901,16 @@ class BrowserSession(BaseModel):
 					'(expected from FirefoxPlaywrightEngine.launch)'
 				)
 			self.browser_profile.cdp_url = ws_url
-			self._connection = BidiBrowserConnection(ws_endpoint=ws_url)
+			# Per-context proxy (geo / egress IP) threaded CLIENT-SIDE from the
+			# profile → new_context(proxy=...); works over the Camoufox ws too.
+			_proxy_dict = None
+			_p = getattr(self.browser_profile, 'proxy', None)
+			if _p is not None:
+				try:
+					_proxy_dict = _p.model_dump(exclude_none=True) if hasattr(_p, 'model_dump') else dict(_p)
+				except Exception:
+					_proxy_dict = None
+			self._connection = BidiBrowserConnection(ws_endpoint=ws_url, proxy=_proxy_dict)
 			await self._connection.start()
 			# Phase-5 facade: stand up the CDP→Playwright proxy so the
 			# raw `cdp_client.send.*` call sites in the watchdogs + dom/service
