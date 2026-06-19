@@ -3813,18 +3813,25 @@ class DefaultActionWatchdog(BaseWatchdog):
 		buid = getattr(element_node, 'backend_node_id', None)
 		if buid:
 			try:
-				handle = await page.evaluate_handle(
-					"""(id) => {
-						const walk = (root) => {
-							for (const el of root.querySelectorAll('*')) {
-								if (el.__buid === id) return el;
-								if (el.shadowRoot) { const r = walk(el.shadowRoot); if (r) return r; }
-							}
-							return null;
-						};
-						return walk(document);
-					}""",
-					buid,
+				# Bound the JS eval: on a half-loaded / skeleton page the execution
+				# context can stall and evaluate_handle would block until browser_use's
+				# 15s event-handler kill (the eBay-results symptom). Fail fast → the
+				# next resolver / the caller's fast-fail click take over.
+				handle = await asyncio.wait_for(
+					page.evaluate_handle(
+						"""(id) => {
+							const walk = (root) => {
+								for (const el of root.querySelectorAll('*')) {
+									if (el.__buid === id) return el;
+									if (el.shadowRoot) { const r = walk(el.shadowRoot); if (r) return r; }
+								}
+								return null;
+							};
+							return walk(document);
+						}""",
+						buid,
+					),
+					timeout=3.0,
 				)
 				el = handle.as_element()
 				if el is not None:
@@ -3866,12 +3873,16 @@ class DefaultActionWatchdog(BaseWatchdog):
 			# agent from looping on the same un-clickable index (the "chat hangs"
 			# symptom). Try the element, then its nearest <a>/[role=link] ancestor.
 			try:
-				await target.evaluate(
-					"""el => {
-						const t = el.closest('a,[role="link"],button,[role="button"]') || el;
-						t.scrollIntoView({block:'center'});
-						t.click();
-					}"""
+				# Bound it too — on a stalled page even the JS click can block.
+				await asyncio.wait_for(
+					target.evaluate(
+						"""el => {
+							const t = el.closest('a,[role="link"],button,[role="button"]') || el;
+							t.scrollIntoView({block:'center'});
+							t.click();
+						}"""
+					),
+					timeout=3.0,
 				)
 				self.logger.info(f'🖱️ (BiDi) JS-clicked {element_node.node_name} after actionability timeout')
 				return None
