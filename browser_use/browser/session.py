@@ -898,6 +898,29 @@ class BrowserSession(BaseModel):
 	async def on_NavigateToUrlEvent(self, event: NavigateToUrlEvent) -> None:
 		"""Handle navigation requests - core browser functionality."""
 		self.logger.debug(f'[on_NavigateToUrlEvent] Received NavigateToUrlEvent: url={event.url}, new_tab={event.new_tab}')
+
+		# BiDi: single-tab posture, no CDP target pool — navigate the live
+		# Playwright page straight through the proxy (→ adapter.goto) and
+		# announce completion. Bypasses the session_manager/target machinery.
+		if self._connection is not None and getattr(self._connection, 'backend', None) == 'bidi':
+			from browser_use.browser.cdp_proxy import _SYNTHETIC_TARGET_ID
+			from browser_use.browser.events import NavigationCompleteEvent
+
+			try:
+				res = await self.cdp_client.send.Page.navigate(params={'url': event.url})
+				err = res.get('errorText') if isinstance(res, dict) else None
+			except Exception as e:
+				err = f'{type(e).__name__}: {e}'
+			self.agent_focus_target_id = cast('TargetID', _SYNTHETIC_TARGET_ID)
+			await self.event_bus.dispatch(
+				NavigationCompleteEvent(
+					target_id=cast('TargetID', _SYNTHETIC_TARGET_ID),
+					url=event.url,
+					error_message=err,
+				)
+			)
+			return
+
 		if not self.agent_focus_target_id:
 			self.logger.warning('Cannot navigate - browser not connected')
 			return
@@ -1864,10 +1887,13 @@ class BrowserSession(BaseModel):
 			# raw `cdp_client.send.*` call sites in the watchdogs + dom/service
 			# route through Playwright instead of crashing on a missing CDP
 			# WebSocket. cdp_client (the property) returns this when backend=='bidi'.
-			from browser_use.browser.cdp_proxy import BidiCdpProxy
+			from browser_use.browser.cdp_proxy import BidiCdpProxy, _SYNTHETIC_TARGET_ID
 
 			self._bidi_cdp_proxy = BidiCdpProxy(self._connection)
 			await self._bidi_cdp_proxy.start()
+			# Point agent focus at the single synthetic BiDi target so the
+			# nav/action guards (which check agent_focus_target_id) pass.
+			self.agent_focus_target_id = cast('TargetID', _SYNTHETIC_TARGET_ID)
 			self.logger.info(
 				f'🦊 Connected via Playwright Firefox BiDi: {ws_url}. '
 				'CDP→Playwright proxy active (BidiCdpProxy): cdp_client.send.* '
