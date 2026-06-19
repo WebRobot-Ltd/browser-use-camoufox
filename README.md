@@ -1,3 +1,61 @@
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<!--  WebRobot fork banner — keep above the upstream README below.         -->
+<!-- ════════════════════════════════════════════════════════════════════ -->
+
+# 🦊 browser-use-camoufox — the official WebRobot hard fork
+
+> **This is the official [WebRobot](https://webrobot.eu) hard fork of [`browser-use`](https://github.com/browser-use/browser-use).**
+> It keeps the `browser_use` import path and public API, but adds first-class
+> **Firefox / [Camoufox](https://camoufox.com)** support driven over **WebDriver-BiDi**
+> (via Playwright) — where upstream is Chromium / CDP-only by design.
+
+## Why this fork exists
+
+Upstream `browser-use` talks to the browser exclusively over the **Chrome DevTools
+Protocol (CDP)** — its watchdogs and DOM service call `cdp_client.send.*` in ~731
+places, and the maintainers have confirmed Firefox/BiDi is out of scope ("it's all
+chrome/cdp"). WebRobot needs a **stealth Firefox (Camoufox)** agent for its
+distributed scraping/automation platform, so this fork makes the **full
+`browser_use.agent.service.Agent` run on Firefox/Camoufox over BiDi**.
+
+## How we do it — a CDP→Playwright proxy (single chokepoint, not 731 edits)
+
+Rather than branch every CDP call site, the fork ships a **CDP facade**
+([`browser_use/browser/cdp_proxy.py`](browser_use/browser/cdp_proxy.py)): a drop-in
+`cdp_use.CDPClient` whose `send_raw` **translates each CDP method into Playwright
+calls** against a Firefox page reached over BiDi. The ~731 call sites run unmodified;
+731 sites collapse to ~79 distinct CDP methods, implemented on demand. The hard part —
+CDP's `backendNodeId`/`objectId` node identity, which Playwright doesn't expose — is
+handled by a synthetic node registry + a single cached DOM scan that backs
+`DOM.getDocument`, `DOMSnapshot.captureSnapshot` and `DOM.describeNode` with consistent ids.
+
+This keeps the fork's edits to upstream tiny, so we can cherry-pick upstream fixes
+without re-porting anything.
+
+## Status
+
+| Milestone | State |
+|---|---|
+| **STARTUP** — `BrowserSession.start()` on Firefox/Camoufox BiDi | ✅ done & validated against a live Camoufox pod |
+| **OBSERVE** — DOM tree + numbered interactive-element index | ✅ working end-to-end (e.g. 234 interactive elements on books.toscrape.com) |
+| **ACT** — navigate / click / type through the agent's event loop | 🚧 in progress (Input translation done; tab-focus + navigation event wiring next) |
+| **REST** — downloads / popups / screencast / network interception watchdogs | ⏭️ no-op'd on BiDi for now |
+
+Also bundled: **`ChatClaudeAgentSdk`** (drive the agent via the Claude Agent SDK /
+subscription) and the page-level `PlaywrightBrowserAdapter`.
+
+## Credits & license
+
+All credit for the agent, its architecture, and the overwhelming majority of this
+code goes to **[browser-use](https://github.com/browser-use/browser-use) by Gregor
+Zunic and contributors**. This fork only adds the Firefox/BiDi layer on top of their
+work. Licensed under **MIT** (unchanged from upstream — see [LICENSE](LICENSE),
+© 2024 Gregor Zunic). WebRobot's modifications are released under the same MIT license.
+
+The complete upstream README follows.
+
+---
+
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="https://github.com/user-attachments/assets/2ccdb752-22fb-41c7-8948-857fc1ad7e24">
   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/user-attachments/assets/774a46d5-27a0-490c-b7d0-e65fcbbfa358">

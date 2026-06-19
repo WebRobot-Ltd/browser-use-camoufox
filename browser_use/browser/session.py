@@ -477,6 +477,14 @@ class BrowserSession(BaseModel):
 		A dead/closing/closed WebSocket returns False, preventing handlers from dispatching
 		CDP commands that would hang until timeout on a broken connection.
 		"""
+		# BiDi (Firefox) path: liveness is the Playwright Browser connection,
+		# surfaced through BidiBrowserConnection.is_open. The CDP→Playwright
+		# proxy is always usable while that's open.
+		if self._connection is not None and getattr(self._connection, 'backend', None) == 'bidi':
+			try:
+				return bool(self._connection.is_open)
+			except Exception:
+				return False
 		if self._cdp_client_root is None or self._cdp_client_root.ws is None:
 			return False
 		try:
@@ -525,6 +533,10 @@ class BrowserSession(BaseModel):
 
 	# Mutable private state shared between watchdogs
 	_cdp_client_root: CDPClient | None = PrivateAttr(default=None)
+	# Phase-5 BiDi facade: the CDP→Playwright proxy returned by the
+	# `cdp_client` property when the connection backend is 'bidi'. Built in
+	# connect() (Firefox branch); None on the CDP/Chromium path.
+	_bidi_cdp_proxy: Any = PrivateAttr(default=None)  # BidiCdpProxy | None
 	# Phase-5a foundation: the protocol-agnostic connection. CDP path:
 	# wraps _cdp_client_root after the existing connect logic builds it.
 	# Firefox/BiDi path: wraps a Playwright Browser obtained via
@@ -1296,7 +1308,18 @@ class BrowserSession(BaseModel):
 	# region - ========== CDP-based replacements for browser_context operations ==========
 	@property
 	def cdp_client(self) -> CDPClient:
-		"""Get the cached root CDP cdp_session.cdp_client. The client is created and started in self.connect()."""
+		"""Get the cached root CDP client. Created+started in self.connect().
+
+		BiDi (Firefox/Camoufox) path: there is no real CDP WebSocket — the
+		root client is a :class:`~browser_use.browser.cdp_proxy.BidiCdpProxy`
+		that exposes the identical cdp_use surface but translates each CDP
+		method into Playwright calls (Phase-5 facade). Returning it here is
+		the single wiring point that lets the ~731 raw ``cdp_client.send.*``
+		call sites run unmodified on Firefox.
+		"""
+		if self._connection is not None and getattr(self._connection, 'backend', None) == 'bidi':
+			assert self._bidi_cdp_proxy is not None, 'BiDi CDP proxy not initialized - browser may not be connected yet'
+			return self._bidi_cdp_proxy  # type: ignore[return-value]
 		assert self._cdp_client_root is not None, 'CDP client not initialized - browser may not be connected yet'
 		return self._cdp_client_root
 
@@ -1493,6 +1516,20 @@ class BrowserSession(BaseModel):
 		Raises:
 			ValueError: If target doesn't exist or session is not available.
 		"""
+		# BiDi (Firefox) path: there is no CDP target pool / SessionManager /
+		# attach-event machinery. Hand back a synthetic CDPSession bound to the
+		# BidiCdpProxy + the single synthetic target/session id. The CDP-shaped
+		# callers (CdpBrowserAdapter, dom/service) then drive Playwright through
+		# the proxy unchanged. (Phase-5 OBSERVE wiring.)
+		if self._connection is not None and getattr(self._connection, 'backend', None) == 'bidi':
+			from browser_use.browser.cdp_proxy import _SYNTHETIC_SESSION_ID, _SYNTHETIC_TARGET_ID
+
+			return CDPSession(
+				cdp_client=self._bidi_cdp_proxy,  # type: ignore[arg-type]
+				target_id=cast('TargetID', _SYNTHETIC_TARGET_ID),
+				session_id=cast('SessionID', _SYNTHETIC_SESSION_ID),
+			)
+
 		assert self._cdp_client_root is not None, 'Root CDP client not initialized'
 		assert self.session_manager is not None, 'SessionManager not initialized'
 
@@ -1823,12 +1860,20 @@ class BrowserSession(BaseModel):
 			self.browser_profile.cdp_url = ws_url
 			self._connection = BidiBrowserConnection(ws_endpoint=ws_url)
 			await self._connection.start()
+			# Phase-5 facade: stand up the CDP→Playwright proxy so the
+			# raw `cdp_client.send.*` call sites in the watchdogs + dom/service
+			# route through Playwright instead of crashing on a missing CDP
+			# WebSocket. cdp_client (the property) returns this when backend=='bidi'.
+			from browser_use.browser.cdp_proxy import BidiCdpProxy
+
+			self._bidi_cdp_proxy = BidiCdpProxy(self._connection)
+			await self._bidi_cdp_proxy.start()
 			self.logger.info(
 				f'🦊 Connected via Playwright Firefox BiDi: {ws_url}. '
-				'Note: most watchdogs still assume CDP — Agent.run() will '
-				'fail downstream until Phase-5b/c/d port them. The page-'
-				'level adapter API works end-to-end through '
-				'PlaywrightBrowserAdapter against this connection.'
+				'CDP→Playwright proxy active (BidiCdpProxy): cdp_client.send.* '
+				'is translated to Playwright. Unimplemented CDP methods raise '
+				'CdpMethodNotImplemented — implement them in cdp_proxy._HANDLERS '
+				'as the harness surfaces them (Phase-5 OBSERVE/ACT milestones).'
 			)
 			return self
 
@@ -2339,6 +2384,21 @@ class BrowserSession(BaseModel):
 		"""Get information about all open tabs using cached target data."""
 		tabs = []
 
+		# BiDi: single-tab posture — synthesize one TabInfo from the live page.
+		if self._connection is not None and getattr(self._connection, 'backend', None) == 'bidi':
+			from browser_use.browser.cdp_proxy import _SYNTHETIC_TARGET_ID
+
+			try:
+				page = self._connection.current_page
+				url = page.url
+				try:
+					title = await page.title()
+				except Exception:
+					title = ''
+				return [TabInfo(target_id=cast('TargetID', _SYNTHETIC_TARGET_ID), url=url, title=title)]
+			except Exception:
+				return tabs
+
 		# Safety check - return empty list if browser not connected yet
 		if not self.session_manager:
 			return tabs
@@ -2415,6 +2475,12 @@ class BrowserSession(BaseModel):
 
 	async def get_current_page_url(self) -> str:
 		"""Get the URL of the current page."""
+		# BiDi: the live URL is on the Playwright page held by the connection.
+		if self._connection is not None and getattr(self._connection, 'backend', None) == 'bidi':
+			try:
+				return self._connection.current_page.url
+			except Exception:
+				return 'about:blank'
 		if self.agent_focus_target_id:
 			target = self.session_manager.get_target(self.agent_focus_target_id)
 			return target.url
@@ -2422,6 +2488,11 @@ class BrowserSession(BaseModel):
 
 	async def get_current_page_title(self) -> str:
 		"""Get the title of the current page."""
+		if self._connection is not None and getattr(self._connection, 'backend', None) == 'bidi':
+			try:
+				return await self._connection.current_page.title()
+			except Exception:
+				return 'Unknown page title'
 		if self.agent_focus_target_id:
 			target = self.session_manager.get_target(self.agent_focus_target_id)
 			return target.title
