@@ -38,11 +38,33 @@ without re-porting anything.
 |---|---|
 | **STARTUP** — `BrowserSession.start()` on Firefox/Camoufox BiDi | ✅ done & validated against a live Camoufox pod |
 | **OBSERVE** — DOM tree + numbered interactive-element index | ✅ working end-to-end (e.g. 234 interactive elements on books.toscrape.com) |
-| **ACT** — navigate / click / type through the agent's event loop | 🚧 in progress (Input translation done; tab-focus + navigation event wiring next) |
-| **REST** — downloads / popups / screencast / network interception watchdogs | ⏭️ no-op'd on BiDi for now |
+| **ACT** — navigate / click / type through the agent's event loop | ✅ done & validated live (eBay search: navigate→input→click→results) |
+| **REST** — downloads / popups / screencast / network interception watchdogs | ⏭️ no-op'd on BiDi (only agent-loop-essential watchdogs attach on Firefox) |
 
-Also bundled: **`ChatClaudeAgentSdk`** (drive the agent via the Claude Agent SDK /
-subscription) and the page-level `PlaywrightBrowserAdapter`.
+The full agent loop runs on Firefox/Camoufox: a real task completes end-to-end
+(navigate → observe → click/type → done) against a live pod.
+
+### Beyond the port — WebRobot additions
+
+- **`ChatClaudeAgentSdk`** — drive the agent via the Claude Agent SDK / Claude
+  subscription (no per-token API key). Set `IS_SANDBOX=1` when the process runs
+  as root (the CLI refuses `--dangerously-skip-permissions` under root otherwise).
+- **Client-side per-context proxy (geo egress IP)** — `BrowserProfile.proxy` is
+  threaded into `new_context(proxy=…)`, so the browser's exit IP is set
+  client-side *even over the Camoufox ws*. With a DataImpulse `__cr.<cc>` username
+  the egress is geo-targeted (validated: `it`→IT IP, `us`→US IP).
+- **Observability — not a black box.** The agentic run exposes *how* it got its
+  answer, which is what lets a run be lifted into a **deterministic ETL pipeline**:
+  - `selectors`: every element index the agent cited → a concrete `xpath` / `css`
+    selector + attributes (captured per step; the agent is system-prompted to cite
+    a `[index]` for every value it reports — what was **read**).
+  - `actions`: the navigate/click/input sequence, each with its target selector —
+    a replayable trace of what was **done**.
+- **Robust BiDi action resolver** — click/type resolve the live element by
+  hierarchical xpath → stable attribute/role locator → proxy element id, so
+  interactions survive SPA re-renders (where a bare-tag xpath would mis-target).
+- Page-level **`PlaywrightBrowserAdapter`** and the **CDP→Playwright proxy facade**
+  (`browser_use/browser/cdp_proxy.py`).
 
 ## Credits & license
 
