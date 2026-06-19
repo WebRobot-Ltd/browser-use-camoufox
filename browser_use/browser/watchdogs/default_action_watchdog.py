@@ -3797,34 +3797,19 @@ class DefaultActionWatchdog(BaseWatchdog):
 		def _esc(v):
 			return str(v).replace('\\', '\\\\').replace('"', '\\"')
 
+		# LEAN: only a non-waiting count() check — never scroll/wait here (the
+		# caller's click/fill scrolls + waits once). On big SPA pages the old
+		# per-candidate scroll_into_view(3s) + multiple waits cost ~15s/action
+		# and hung the chat. count() is instant.
 		async def _ok(loc):
 			try:
-				if await loc.count() == 1:
-					try:
-						await loc.scroll_into_view_if_needed(timeout=3_000)
-					except Exception:
-						pass
-					return loc
+				return loc if await loc.count() == 1 else None
 			except Exception:
 				return None
-			return None
 
-		# 1) Hierarchical xpath (only if it actually has structure, not a bare tag).
-		xpath = getattr(element_node, 'xpath', None)
-		if xpath and '/' in xpath:
-			loc = await _ok(page.locator(f'xpath={xpath}').first)
-			if loc:
-				return loc
-
-		# 2) Stable attribute/role locator — most robust for inputs/buttons/links.
-		for key in ('id', 'name', 'data-testid', 'aria-label', 'placeholder'):
-			val = attrs.get(key)
-			if val:
-				loc = await _ok(page.locator(f'{tag or "*"}[{key}="{_esc(val)}"]').first)
-				if loc:
-					return loc
-
-		# 3) Proxy per-element id (__buid) — valid pre-re-render.
+		# 1) Proxy per-element id (__buid) FIRST — exact element the agent saw, one
+		# JS call (querySelectorAll walk is sub-ms even on large pages). Returns an
+		# ElementHandle (click/fill scroll into view themselves).
 		buid = getattr(element_node, 'backend_node_id', None)
 		if buid:
 			try:
@@ -3843,27 +3828,56 @@ class DefaultActionWatchdog(BaseWatchdog):
 				)
 				el = handle.as_element()
 				if el is not None:
-					try:
-						await el.scroll_into_view_if_needed(timeout=3_000)
-					except Exception:
-						pass
 					return el
 			except Exception as e:
 				self.logger.debug(f'(BiDi) __buid resolve failed for {buid}: {e}')
+
+		# 2) Hierarchical xpath (only if it has structure, not a bare tag).
+		xpath = getattr(element_node, 'xpath', None)
+		if xpath and '/' in xpath:
+			loc = await _ok(page.locator(f'xpath={xpath}').first)
+			if loc:
+				return loc
+
+		# 3) Stable attribute/role locator — robust for inputs/buttons/links.
+		for key in ('id', 'name', 'data-testid', 'aria-label', 'placeholder'):
+			val = attrs.get(key)
+			if val:
+				loc = await _ok(page.locator(f'{tag or "*"}[{key}="{_esc(val)}"]').first)
+				if loc:
+					return loc
 
 		# 4) Last resort: the raw xpath locator (may be a bare tag — best effort).
 		return self._bidi_locator(element_node)
 
 	async def _on_click_bidi(self, event):
 		element_node = event.node
+		target = await self._bidi_target(element_node)
+		# 1) Normal actionable click (waits for visible/stable/receives-events).
 		try:
-			target = await self._bidi_target(element_node)
-			await target.click(timeout=5_000)
+			await target.click(timeout=2_500)
 			self.logger.debug(f'🖱️ (BiDi) Clicked {element_node.node_name} (buid={getattr(element_node, "backend_node_id", None)})')
 			return None
-		except Exception as e:
-			self.logger.error(f'[DefaultActionWatchdog] (BiDi) click failed: {e}')
-			raise
+		except Exception as e1:
+			# 2) Actionability timeout (lazy-loaded skeleton, covered by an
+			# overlay, zero-size wrapper — very common on SPA result pages like
+			# eBay). Force a JS click that bypasses the actionability checks —
+			# this mirrors the CDP path's `el.click()` fallback and stops the
+			# agent from looping on the same un-clickable index (the "chat hangs"
+			# symptom). Try the element, then its nearest <a>/[role=link] ancestor.
+			try:
+				await target.evaluate(
+					"""el => {
+						const t = el.closest('a,[role="link"],button,[role="button"]') || el;
+						t.scrollIntoView({block:'center'});
+						t.click();
+					}"""
+				)
+				self.logger.info(f'🖱️ (BiDi) JS-clicked {element_node.node_name} after actionability timeout')
+				return None
+			except Exception as e2:
+				self.logger.error(f'[DefaultActionWatchdog] (BiDi) click failed (normal: {e1}; js: {e2})')
+				raise
 
 	async def _on_type_text_bidi(self, event):
 		element_node = event.node
