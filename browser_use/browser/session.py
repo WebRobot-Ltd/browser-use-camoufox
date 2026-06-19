@@ -1720,6 +1720,18 @@ class BrowserSession(BaseModel):
 		from browser_use.browser.watchdogs.security_watchdog import SecurityWatchdog
 		from browser_use.browser.watchdogs.storage_state_watchdog import StorageStateWatchdog
 
+		# On the Firefox/BiDi backend the CDP-centric "ambient" watchdogs are
+		# either unsupported or actively harmful (e.g. AboutBlankWatchdog spawns
+		# a fresh about:blank page that the agent then observes instead of the
+		# real page; DownloadsWatchdog/PermissionsWatchdog throw on the missing
+		# CDP target pool). Attach ONLY the agent-loop-essential watchdogs:
+		# DOM (observe), DefaultAction (act), Screenshot (DOM depends on it),
+		# LocalBrowser (launch). Gate on browser_type — _connection isn't built
+		# yet at attach time (connect() runs after attach_all_watchdogs()).
+		from browser_use.browser.profile import BrowserType
+
+		_bidi = self.browser_profile.browser_type == BrowserType.FIREFOX
+
 		# Initialize CrashWatchdog
 		# CrashWatchdog.model_rebuild()
 		# self._crash_watchdog = CrashWatchdog(event_bus=self.event_bus, browser_session=self)
@@ -1735,7 +1747,8 @@ class BrowserSession(BaseModel):
 		# self.event_bus.on(TabClosedEvent, self._downloads_watchdog.on_TabClosedEvent)
 		# self.event_bus.on(BrowserStoppedEvent, self._downloads_watchdog.on_BrowserStoppedEvent)
 		# self.event_bus.on(NavigationCompleteEvent, self._downloads_watchdog.on_NavigationCompleteEvent)
-		self._downloads_watchdog.attach_to_session()
+		if not _bidi:
+			self._downloads_watchdog.attach_to_session()
 		if self.browser_profile.auto_download_pdfs:
 			self.logger.debug('📄 PDF auto-download enabled for this session')
 
@@ -1754,7 +1767,8 @@ class BrowserSession(BaseModel):
 				auto_save_interval=60.0,  # 1 minute instead of 30 seconds
 				save_on_change=False,  # Only save on shutdown by default
 			)
-			self._storage_state_watchdog.attach_to_session()
+			if not _bidi:
+				self._storage_state_watchdog.attach_to_session()
 			self.logger.debug(
 				f'🍪 StorageStateWatchdog enabled (storage_state: {bool(self.browser_profile.storage_state)}, user_data_dir: {bool(self.browser_profile.user_data_dir)})'
 			)
@@ -1774,7 +1788,8 @@ class BrowserSession(BaseModel):
 		self._security_watchdog = SecurityWatchdog(event_bus=self.event_bus, browser_session=self)
 		# Core navigation is now handled in BrowserSession directly
 		# SecurityWatchdog only handles security policy enforcement
-		self._security_watchdog.attach_to_session()
+		if not _bidi:
+			self._security_watchdog.attach_to_session()
 
 		# Initialize AboutBlankWatchdog (handles about:blank pages and DVD loading animation on first load)
 		AboutBlankWatchdog.model_rebuild()
@@ -1783,20 +1798,23 @@ class BrowserSession(BaseModel):
 		# self.event_bus.on(BrowserStoppedEvent, self._aboutblank_watchdog.on_BrowserStoppedEvent)
 		# self.event_bus.on(TabCreatedEvent, self._aboutblank_watchdog.on_TabCreatedEvent)
 		# self.event_bus.on(TabClosedEvent, self._aboutblank_watchdog.on_TabClosedEvent)
-		self._aboutblank_watchdog.attach_to_session()
+		if not _bidi:
+			self._aboutblank_watchdog.attach_to_session()
 
 		# Initialize PopupsWatchdog (handles accepting and dismissing JS dialogs, alerts, confirm, onbeforeunload, etc.)
 		PopupsWatchdog.model_rebuild()
 		self._popups_watchdog = PopupsWatchdog(event_bus=self.event_bus, browser_session=self)
 		# self.event_bus.on(TabCreatedEvent, self._popups_watchdog.on_TabCreatedEvent)
 		# self.event_bus.on(DialogCloseEvent, self._popups_watchdog.on_DialogCloseEvent)
-		self._popups_watchdog.attach_to_session()
+		if not _bidi:
+			self._popups_watchdog.attach_to_session()
 
 		# Initialize PermissionsWatchdog (handles granting and revoking browser permissions like clipboard, microphone, camera, etc.)
 		PermissionsWatchdog.model_rebuild()
 		self._permissions_watchdog = PermissionsWatchdog(event_bus=self.event_bus, browser_session=self)
 		# self.event_bus.on(BrowserConnectedEvent, self._permissions_watchdog.on_BrowserConnectedEvent)
-		self._permissions_watchdog.attach_to_session()
+		if not _bidi:
+			self._permissions_watchdog.attach_to_session()
 
 		# Initialize DefaultActionWatchdog (handles all default actions like click, type, scroll, go back, go forward, refresh, wait, send keys, upload file, scroll to text, etc.)
 		DefaultActionWatchdog.model_rebuild()
@@ -1831,13 +1849,15 @@ class BrowserSession(BaseModel):
 		# Initialize RecordingWatchdog (handles video recording)
 		RecordingWatchdog.model_rebuild()
 		self._recording_watchdog = RecordingWatchdog(event_bus=self.event_bus, browser_session=self)
-		self._recording_watchdog.attach_to_session()
+		if not _bidi:
+			self._recording_watchdog.attach_to_session()
 
 		# Initialize HarRecordingWatchdog if record_har_path is configured (handles HTTPS HAR capture)
 		if self.browser_profile.record_har_path:
 			HarRecordingWatchdog.model_rebuild()
 			self._har_recording_watchdog = HarRecordingWatchdog(event_bus=self.event_bus, browser_session=self)
-			self._har_recording_watchdog.attach_to_session()
+			if not _bidi:
+				self._har_recording_watchdog.attach_to_session()
 
 		# Initialize CaptchaWatchdog (listens for captcha solver events from the browser proxy)
 		if self.browser_profile.captcha_solver:

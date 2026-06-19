@@ -260,9 +260,10 @@ class BidiCdpProxy(CDPClient):
 		url = params.get('url') or 'about:blank'
 		if url and url != 'about:blank':
 			try:
-				await self._adapter().goto(url)
+				await self._adapter().goto(url, wait_until='domcontentloaded')
 			except Exception:
 				pass
+			self._invalidate_scan()
 		return {'targetId': _SYNTHETIC_TARGET_ID}
 
 	async def _Target_attachToTarget(self, params: dict, session_id: Optional[str]) -> dict:
@@ -290,9 +291,20 @@ class BidiCdpProxy(CDPClient):
 
 	# ── Page ────────────────────────────────────────────────────────────
 	async def _Page_navigate(self, params: dict, session_id: Optional[str]) -> dict:
-		res = await self._adapter().goto(params['url'])
+		# Wait only for DOMContentLoaded, NOT the full 'load' event: through a
+		# remote Camoufox + proxy the 'load' event (all images/subresources)
+		# frequently times out, leaving the page blank and the agent stuck in a
+		# navigate/observe retry loop. DOMContentLoaded is enough — the DOM tree
+		# + interactive elements are ready, and use_vision doesn't need images.
+		err = None
+		try:
+			await self._adapter().goto(params['url'], wait_until='domcontentloaded')
+		except Exception as e:
+			# Don't fail navigation on a load-state timeout: the document may
+			# well be usable. Surface the text but let the observe decide.
+			err = f'{type(e).__name__}: {e}'
 		self._invalidate_scan()
-		return {'frameId': _SYNTHETIC_FRAME_ID, 'loaderId': 'BIDI-LOADER-0', 'errorText': None if res else 'navigation failed'}
+		return {'frameId': _SYNTHETIC_FRAME_ID, 'loaderId': 'BIDI-LOADER-0', 'errorText': err}
 
 	async def _Page_reload(self, params: dict, session_id: Optional[str]) -> dict:
 		await self._adapter().reload()
