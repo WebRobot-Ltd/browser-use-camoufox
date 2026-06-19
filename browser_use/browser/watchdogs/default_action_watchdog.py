@@ -3762,11 +3762,12 @@ class DefaultActionWatchdog(BaseWatchdog):
 			raise RuntimeError(f'no BiDi current_page: {e}')
 
 	def _bidi_locator(self, element_node):
-		"""Build a Playwright locator from an EnhancedDOMTreeNode.
+		"""Build a Playwright locator from an EnhancedDOMTreeNode via XPath.
 
-		Uses the node's xpath (every EnhancedDOMTreeNode carries one,
-		derived from the DOM walk) — Playwright accepts XPath via the
-		``xpath=`` selector engine.
+		FALLBACK ONLY — prefer :meth:`_bidi_target` which resolves by the CDP
+		proxy's stable per-element id. The xpath here is unreliable when the
+		node's parent chain isn't materialised (it degrades to just the tag
+		name, e.g. ``xpath=input``, which matches the wrong element / times out).
 		"""
 		page = self._bidi_page()
 		xpath = getattr(element_node, 'xpath', None)
@@ -3775,14 +3776,90 @@ class DefaultActionWatchdog(BaseWatchdog):
 		# Playwright's "xpath=" prefix maps to the XPath engine.
 		return page.locator(f'xpath={xpath}').first
 
+	async def _bidi_target(self, element_node):
+		"""Resolve an EnhancedDOMTreeNode to a clickable/fillable Playwright
+		target — robust across SPAs that re-render between observe and act.
+
+		Tries, in order, structure/content-based resolvers that re-query the
+		LIVE DOM (so a re-render doesn't break them):
+		  1. Hierarchical XPath (``html/body/...``) — exact and unique when the
+		     node's parent chain is materialised.
+		  2. A stable attribute/role locator built from the node's own
+		     id/name/placeholder/aria-label/type — survives node replacement.
+		  3. The CDP proxy's per-element id (``el.__buid``) — only valid while
+		     the observed nodes are still live (no SPA re-render).
+		Each candidate is accepted only if it resolves to exactly one element.
+		"""
+		page = self._bidi_page()
+		attrs = getattr(element_node, 'attributes', None) or {}
+		tag = (getattr(element_node, 'node_name', '') or '').lower()
+
+		def _esc(v):
+			return str(v).replace('\\', '\\\\').replace('"', '\\"')
+
+		async def _ok(loc):
+			try:
+				if await loc.count() == 1:
+					try:
+						await loc.scroll_into_view_if_needed(timeout=3_000)
+					except Exception:
+						pass
+					return loc
+			except Exception:
+				return None
+			return None
+
+		# 1) Hierarchical xpath (only if it actually has structure, not a bare tag).
+		xpath = getattr(element_node, 'xpath', None)
+		if xpath and '/' in xpath:
+			loc = await _ok(page.locator(f'xpath={xpath}').first)
+			if loc:
+				return loc
+
+		# 2) Stable attribute/role locator — most robust for inputs/buttons/links.
+		for key in ('id', 'name', 'data-testid', 'aria-label', 'placeholder'):
+			val = attrs.get(key)
+			if val:
+				loc = await _ok(page.locator(f'{tag or "*"}[{key}="{_esc(val)}"]').first)
+				if loc:
+					return loc
+
+		# 3) Proxy per-element id (__buid) — valid pre-re-render.
+		buid = getattr(element_node, 'backend_node_id', None)
+		if buid:
+			try:
+				handle = await page.evaluate_handle(
+					"""(id) => {
+						const walk = (root) => {
+							for (const el of root.querySelectorAll('*')) {
+								if (el.__buid === id) return el;
+								if (el.shadowRoot) { const r = walk(el.shadowRoot); if (r) return r; }
+							}
+							return null;
+						};
+						return walk(document);
+					}""",
+					buid,
+				)
+				el = handle.as_element()
+				if el is not None:
+					try:
+						await el.scroll_into_view_if_needed(timeout=3_000)
+					except Exception:
+						pass
+					return el
+			except Exception as e:
+				self.logger.debug(f'(BiDi) __buid resolve failed for {buid}: {e}')
+
+		# 4) Last resort: the raw xpath locator (may be a bare tag — best effort).
+		return self._bidi_locator(element_node)
+
 	async def _on_click_bidi(self, event):
 		element_node = event.node
 		try:
-			locator = self._bidi_locator(element_node)
-			await locator.click(timeout=10_000)
-			self.logger.debug(
-				f'🖱️ (BiDi) Clicked {element_node.node_name} (xpath={element_node.xpath[:80]})'
-			)
+			target = await self._bidi_target(element_node)
+			await target.click(timeout=5_000)
+			self.logger.debug(f'🖱️ (BiDi) Clicked {element_node.node_name} (buid={getattr(element_node, "backend_node_id", None)})')
 			return None
 		except Exception as e:
 			self.logger.error(f'[DefaultActionWatchdog] (BiDi) click failed: {e}')
@@ -3796,10 +3873,10 @@ class DefaultActionWatchdog(BaseWatchdog):
 				# "Type to whatever has focus" — use page keyboard.
 				await self._bidi_page().keyboard.type(text)
 				return None
-			locator = self._bidi_locator(element_node)
+			target = await self._bidi_target(element_node)
 			# fill() clears + types atomically; matches the CDP _set_value
 			# / _input_text_element_node_impl posture for input/textarea.
-			await locator.fill(text, timeout=10_000)
+			await target.fill(text, timeout=5_000)
 			return None
 		except Exception as e:
 			self.logger.error(f'[DefaultActionWatchdog] (BiDi) type_text failed: {e}')
